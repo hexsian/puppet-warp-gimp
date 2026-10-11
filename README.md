@@ -32,6 +32,9 @@ GIMP layer filter, so you can reopen and edit it at any time.
 https://github.com/user-attachments/assets/7aa5b27d-8a5c-434b-b70f-2c4b4fb20dce
 
 
+## How to use
+
+**Tools ▸ Transform Tools ▸ Puppet Warp (ARAP)…**
 
 ## Install
 
