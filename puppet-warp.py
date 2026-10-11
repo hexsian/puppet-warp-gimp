@@ -63,12 +63,10 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals
 
 
 def _gegl_user_dir():
-    """Per-user GEGL plug-in dir: %APPDATA%\\gegl-0.4\\plug-ins on Windows."""
-    if _IS_WIN:
-        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") \
-            or os.path.expanduser("~")
-        return os.path.join(base, "gegl-0.4", "plug-ins")
-    return os.path.expanduser("~/.local/share/gegl-0.4/plug-ins")
+    """Per-user GEGL plug-in dir, exactly where GEGL scans for operations:
+    $XDG_DATA_HOME/gegl-0.4/plug-ins (Linux), %LOCALAPPDATA%\\gegl-0.4\\plug-ins
+    (Windows; NOT %APPDATA%, which is the roaming folder)."""
+    return os.path.join(GLib.get_user_data_dir(), "gegl-0.4", "plug-ins")
 
 
 GEGL_USER_DIR = _gegl_user_dir()
@@ -78,6 +76,7 @@ MW_C = os.path.join(PLUGIN_DIR, "puppet-warp.c")
 AGRID_C = os.path.join(PLUGIN_DIR, "arap_grid.c")
 
 _op_ready = False
+_op_freshly_installed = False
 _LIB = None
 
 
@@ -181,6 +180,32 @@ def _build_so():
         return False
 
 
+def _install_lib():
+    """Copy the shipped/built binary into GEGL's user plug-in dir.
+
+    Runs even when nothing was compiled, so a prebuilt .dll/.so from a release
+    works without a compiler. GEGL inside GIMP only discovers a new operation
+    at GIMP startup, so the first install needs one GIMP restart. On Windows a
+    DLL that GIMP already loaded cannot be overwritten until GIMP is closed.
+    """
+    global _op_freshly_installed
+    dst = os.path.join(GEGL_USER_DIR, _LIB_NAME)
+    if not os.path.exists(MW_SO):
+        return
+    try:
+        if os.path.exists(dst) \
+                and os.path.getsize(dst) == os.path.getsize(MW_SO) \
+                and os.path.getmtime(dst) >= os.path.getmtime(MW_SO):
+            return
+        os.makedirs(GEGL_USER_DIR, exist_ok=True)
+        fresh = not os.path.exists(dst)
+        shutil.copy2(MW_SO, dst)
+        _op_freshly_installed = fresh
+    except Exception as e:
+        print(f"[puppet-warp] could not install {dst}: {e} "
+              "(close GIMP, reopen it and try again to update the operation)")
+
+
 def _load_op():
     """Register the GEGL operation directory with GEGGL."""
     for d in (PLUGIN_DIR, GEGL_USER_DIR):
@@ -245,6 +270,7 @@ def ensure_op():
         return True
     _cleanup_orphan_sidecars()
     _build_so()
+    _install_lib()
     _load_op()
     _load_arap_lib()
     _op_ready = True
@@ -1402,7 +1428,7 @@ class PuppetWarpPlugin(Gimp.PlugIn):
         proc.set_menu_label("_Puppet Warp (ARAP)...")
         proc.add_menu_path("<Image>/Filters/Deform")
         proc.add_menu_path("<Image>/Tools/Transform Tools")
-        proc.set_attribution("Antigravity", "Antigravity", "2026")
+        proc.set_attribution("Hexsian", "Hexsian", "2026")
         proc.set_documentation(
             "ARAP-based puppet warp. Non-destructive and re-editable. "
             "Isolate your selection to its own layer before warping.",
@@ -1475,6 +1501,10 @@ class PuppetWarpPlugin(Gimp.PlugIn):
             except OSError:
                 pass
         print(f"[puppet-warp] applied filter, pins={pin_count}, sidecar={bool(token)}")
+        if _op_freshly_installed:
+            Gimp.message("Puppet Warp: the GEGL operation was installed into "
+                         f"{GEGL_USER_DIR}.\nRestart GIMP once so the filter "
+                         "can render.")
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
 
 
