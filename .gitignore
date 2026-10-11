@@ -1,0 +1,36 @@
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# ── Build artifacts (temp, never commit) ──────────────────
+*.o
+*.a
+*.lo
+*.la
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ── Root-level binaries (dùng binaries/ thay vì commit ở đây) ──
+/puppet-warp.so
+/puppet-warp.dll
+
+# ── Editors ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Local test files ───────────────────────────────────────
+/tmp/
+/test/
+*.log
