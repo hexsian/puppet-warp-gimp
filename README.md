@@ -49,8 +49,7 @@ Or download a packaged zip from the [Releases](../../releases) page.
 1. Extract the zip. You get a folder named `puppet-warp`.
 2. Copy that folder to `%APPDATA%\GIMP\3.2\plug-ins\`
    (final path: `%APPDATA%\GIMP\3.2\plug-ins\puppet-warp\puppet-warp.py`).
-3. Start GIMP and run the filter once (**Filters ▸ Deform ▸ Puppet Warp (ARAP)…**).
-   The plug-in copies `puppet-warp.dll` to `%LOCALAPPDATA%\gegl-0.4\plug-ins\`
+3. Start GIMP and run the filter once. The plug-in copies `puppet-warp.dll` to `%LOCALAPPDATA%\gegl-0.4\plug-ins\`
    and tells you to restart GIMP.
 4. Restart GIMP once. After that the filter works normally.
 
