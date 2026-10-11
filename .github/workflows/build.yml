@@ -1,0 +1,43 @@
+name: Build Windows DLL
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gegl
+
+      - name: Build DLL
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -shared -I. puppet-warp.c arap_grid.c \
+            -o puppet-warp.dll -lm \
+            $(pkg-config --cflags --libs gegl-0.4 glib-2.0 cairo)
+
+      - name: Verify DLL
+        shell: msys2 {0}
+        run: |
+          ls -lh puppet-warp.dll
+          objdump -p puppet-warp.dll | grep "DLL Name"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: puppet-warp-dll
+          path: puppet-warp.dll
+          retention-days: 30
