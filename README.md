@@ -26,6 +26,13 @@ GIMP layer filter, so you can reopen and edit it at any time.
 - GIMP 3.2 (Python plug-ins enabled, which is the default)
 - Windows x64, or Linux x86_64
 
+## Demo
+
+
+https://github.com/user-attachments/assets/7aa5b27d-8a5c-434b-b70f-2c4b4fb20dce
+
+
+
 ## Install
 
 Grab the prebuilt binary for your system from `binaries/`:
