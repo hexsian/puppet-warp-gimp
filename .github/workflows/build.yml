@@ -20,6 +20,7 @@ jobs:
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-gegl
 
       - name: Build DLL
@@ -33,7 +34,7 @@ jobs:
         shell: msys2 {0}
         run: |
           ls -lh puppet-warp.dll
-          objdump -p puppet-warp.dll | grep "DLL Name"
+          objdump -p puppet-warp.dll | grep "DLL Name" || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
