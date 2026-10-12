@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Puppet Warp: ARAP-based non-destructive deform filter for GIMP 3.
-
 Pins translate (single-vertex Dirichlet), optionally rotate/scale via a
 similarity ring. Preview is rendered in C (cairo) and falls back to Python;
 apply runs as a GEGL filter whose params live in the XCF. Background layers
 are shown (static, not warped) so the preview matches the canvas.
-
 Cross-platform: builds/loads .so on Linux/macOS and .dll on Windows (MSYS2 /
 MinGW-w64 toolchain with gegl-0.4, glib-2.0, cairo dev packages required).
-
+D1 (tool-feel dialog): non-modal window so the canvas and Layers dialog stay
+usable while warping; Enter/Space commits and Esc cancels like a GIMP tool;
+window position/size/maximized state persist across sessions; a pidfile
+guard prevents opening a second dialog from another GIMP instance.
 Runtime env switches: PW_DEBUG=1 (logs), PW_NO_C_PREVIEW=1 (Python raster),
 PW_NO_BG=1 (no background layer).
 """
@@ -51,6 +52,7 @@ _IS_WIN = platform.system() == "Windows"
 _LIB_EXT = ".dll" if _IS_WIN else ".so"
 _LIB_NAME = "puppet-warp" + _LIB_EXT
 
+
 def _default_plugin_dir():
     if _IS_WIN:
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -70,10 +72,11 @@ def _gegl_user_dir():
 
 
 GEGL_USER_DIR = _gegl_user_dir()
-
 MW_SO = os.path.join(PLUGIN_DIR, _LIB_NAME)      # name kept for history; ext varies
 MW_C = os.path.join(PLUGIN_DIR, "puppet-warp.c")
 AGRID_C = os.path.join(PLUGIN_DIR, "arap_grid.c")
+UI_STATE = os.path.join(PLUGIN_DIR, "ui-state.json")
+DIALOG_PID = os.path.join(GLib.get_tmp_dir(), "puppet-warp-dialog.pid")
 
 _op_ready = False
 _op_freshly_installed = False
@@ -182,7 +185,6 @@ def _build_so():
 
 def _install_lib():
     """Copy the shipped/built binary into GEGL's user plug-in dir.
-
     Runs even when nothing was compiled, so a prebuilt .dll/.so from a release
     works without a compiler. GEGL inside GIMP only discovers a new operation
     at GIMP startup, so the first install needs one GIMP restart. On Windows a
@@ -207,7 +209,7 @@ def _install_lib():
 
 
 def _load_op():
-    """Register the GEGL operation directory with GEGGL."""
+    """Register the GEGL operation directory with GEGL."""
     for d in (PLUGIN_DIR, GEGL_USER_DIR):
         try:
             if os.path.isdir(d) and hasattr(Gegl, "load_directory"):
@@ -263,6 +265,56 @@ def _cleanup_orphan_sidecars():
         pass
 
 
+def _dialog_lock_acquire():
+    """Single-instance guard for the non-modal dialog. Returns the lock path
+    when acquired, "" when the lock is unusable (proceed without guard),
+    or None when another live GIMP instance already owns the dialog."""
+    try:
+        if os.path.exists(DIALOG_PID):
+            with open(DIALOG_PID) as fh:
+                old = int(fh.read().strip() or "0")
+            if old not in (0, os.getpid()) and _pid_alive(old):
+                return None
+        with open(DIALOG_PID, "w") as fh:
+            fh.write(str(os.getpid()))
+        return DIALOG_PID
+    except Exception:
+        return ""
+
+
+def _dialog_lock_release(path):
+    """Remove the pidfile only if it still belongs to this process."""
+    if not path:
+        return
+    try:
+        with open(path) as fh:
+            cur = int(fh.read().strip() or "0")
+        if cur == os.getpid():
+            os.unlink(path)
+    except Exception:
+        pass
+
+
+def _load_ui_state():
+    """Read persisted dialog geometry; None when absent or unreadable."""
+    try:
+        with open(UI_STATE) as fh:
+            st = json.load(fh)
+        return st if isinstance(st, dict) else None
+    except Exception:
+        return None
+
+
+def _save_ui_state(x, y, w, h, maximized):
+    """Persist dialog geometry for the next session."""
+    try:
+        with open(UI_STATE, "w") as fh:
+            json.dump({"x": int(x), "y": int(y), "w": int(w),
+                       "h": int(h), "max": bool(maximized)}, fh)
+    except Exception:
+        pass
+
+
 def ensure_op():
     """One-time init: clean orphans, build binary, load op, load lib."""
     global _op_ready
@@ -279,7 +331,6 @@ def ensure_op():
 
 def _unpack_offsets(t):
     """Return (x, y) from a get_offsets() tuple regardless of binding layout.
-
     Some GIMP 3 builds return (success, x, y) where success is a bool; others
     return (x, y) or (x, y, unknown). Detect by the type of element 0 (a pixel
     coordinate is never a bool) so no layout has to be guessed.
@@ -336,9 +387,18 @@ def load_existing_params(drawable):
 
 class PuppetWarpDialog(Gtk.Dialog):
     def __init__(self, image, drawable):
-        super().__init__(title="Puppet Warp (ARAP)", modal=True,
+        super().__init__(title="Puppet Warp (ARAP)",
+                         modal=False,          # D1: canvas/Layers stay usable
                          destroy_with_parent=True)
-        self.set_default_size(1000, 780)
+        st = _load_ui_state()                  # D1: restore window geometry
+        if st and st.get("w", 0) > 200 and st.get("h", 0) > 150:
+            self.set_default_size(int(st["w"]), int(st["h"]))
+            if st.get("max"):
+                self.maximize()
+            else:
+                self.move(int(st.get("x", 0)), int(st.get("y", 0)))
+        else:
+            self.set_default_size(1000, 780)
         self.image = image
         self.drawable = drawable
         cw = drawable.get_width()
@@ -504,12 +564,26 @@ class PuppetWarpDialog(Gtk.Dialog):
             self.restored_pins = len(self.pins)
 
         self._build_ui()
+        self.connect("key-press-event", self._on_dialog_key)   # D1 tool keys
         if self.restored_pins:
             self.status_label.set_label(
                 f"Restored {self.restored_pins} pins from the active Puppet "
                 "Warp filter. Use Clear Pins to start a new session.")
         self.fit_to_view()
         self._solve_preview()
+
+    def _on_dialog_key(self, w, e):
+        """D1: Esc cancels; Enter/Space commits. Buttons, checkboxes and spins
+        consume their own Space/Enter before the event reaches the window, so
+        committing here never steals a widget activation."""
+        kv = e.keyval
+        if kv == Gdk.KEY_Escape:
+            self.response(Gtk.ResponseType.CANCEL)
+            return True
+        if kv in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.response(Gtk.ResponseType.OK)
+            return True
+        return False
 
     def _ensure_checker(self):
         """Build/cache the transparency checkerboard surface."""
@@ -623,7 +697,8 @@ class PuppetWarpDialog(Gtk.Dialog):
                   "Orange ring: drag dot = rotate | Alt+wheel: rotate | "
                   "Ctrl+wheel: scale | Double-click ring: clear sim | "
                   "Uncheck Rotate/Scale: disable (values kept) | "
-                  "Ctrl+Z / Ctrl+Shift+Z: undo/redo")
+                  "Ctrl+Z / Ctrl+Shift+Z: undo/redo | "
+                  "Enter/Space: apply | Esc: cancel")
         self.status_label.set_xalign(0.0)
         ca.pack_start(self.status_label, False, False, 0)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
@@ -1352,8 +1427,8 @@ def apply_filter_to_drawable(drawable, params_json):
     try:
         for f in list(drawable.get_filters() or []):
             try:
-                if f.get_operation_name() == GEGL_OP_NAME:
-                    stale.append(f)
+                f.get_config().get_property("params-json")
+                stale.append(f)
             except Exception:
                 continue
     except Exception:
@@ -1434,7 +1509,7 @@ class PuppetWarpPlugin(Gimp.PlugIn):
             "Isolate your selection to its own layer before warping.",
             "Click to add pins, drag to move, right-click to delete, "
             "double-click to reset a pin, drag the orange ring to rotate, "
-            "Ctrl+wheel to scale.", name)
+            "Ctrl+wheel to scale. Enter/Space applies, Esc cancels.", name)
         return proc
 
     def run(self, procedure, run_mode, image, drawables, config, data):
@@ -1448,64 +1523,78 @@ class PuppetWarpPlugin(Gimp.PlugIn):
                 GLib.Error("Interactive only."))
         ensure_op()
         GimpUi.init(PLUG_IN_BINARY)
+        lock = _dialog_lock_acquire()
+        if lock is None:
+            Gimp.message("Puppet Warp: the dialog is already open in another "
+                         "GIMP instance.")
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
         try:
-            dlg = PuppetWarpDialog(image, drawables[0])
-        except RuntimeError as e:
-            Gimp.message("Puppet Warp: " + str(e))
-            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
-        GimpUi.window_set_transient(dlg)
-        resp = dlg.run()
-        params_json = dlg.get_params_json()
-        pin_count = len(dlg.pins)
-        verts_snapshot = list(dlg.deformed_verts or [])
-        cols_snap, rows_snap = dlg.cols, dlg.rows
-        dlg.destroy()
-        if resp != Gtk.ResponseType.OK:
-            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
-        if pin_count == 0:
-            remove_filter_from_drawable(drawables[0])
+            try:
+                dlg = PuppetWarpDialog(image, drawables[0])
+            except RuntimeError as e:
+                Gimp.message("Puppet Warp: " + str(e))
+                return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
+            GimpUi.window_set_transient(dlg)
+            resp = dlg.run()
+            params_json = dlg.get_params_json()
+            pin_count = len(dlg.pins)
+            verts_snapshot = list(dlg.deformed_verts or [])
+            cols_snap, rows_snap = dlg.cols, dlg.rows
+            try:                                   # D1: persist window geometry
+                gx, gy = dlg.get_position()
+                gw, gh = dlg.get_size()
+                _save_ui_state(gx, gy, gw, gh, dlg.is_maximized())
+            except Exception:
+                pass
+            dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
+            if pin_count == 0:
+                remove_filter_from_drawable(drawables[0])
+                try:
+                    Gimp.displays_flush()
+                except Exception:
+                    pass
+                return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
+            token = ""
+            path = ""
+            if verts_snapshot and len(verts_snapshot) == (cols_snap + 1) * (rows_snap + 1):
+                import struct
+                import time
+                token = f"{os.getpid()}-{time.time_ns()}"
+                path = os.path.join(GLib.get_tmp_dir(),
+                                    f"puppet-warp-verts-{token}.bin")
+                flat = [c for v in verts_snapshot for c in v]
+                try:
+                    with open(path, "wb") as fh:
+                        fh.write(token.encode().ljust(64, b"\0"))
+                        fh.write(struct.pack("<III", cols_snap, rows_snap,
+                                             len(verts_snapshot)))
+                        fh.write(struct.pack(f"<{len(flat)}f", *flat))
+                except Exception as e:
+                    print(f"[puppet-warp] sidecar write failed: {e}")
+                    token = ""
+            pkg = json.loads(params_json)
+            pkg["verts_token"] = token
+            params_json = json.dumps(pkg, separators=(',', ':'), sort_keys=True)
+            apply_filter_to_drawable(drawables[0], params_json)
             try:
                 Gimp.displays_flush()
             except Exception:
                 pass
+            if token and path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            print(f"[puppet-warp] applied filter, pins={pin_count}, sidecar={bool(token)}")
+            if _op_freshly_installed:
+                Gimp.message("Puppet Warp: the GEGL operation was installed into "
+                             f"{GEGL_USER_DIR}. Restart GIMP once so the filter "
+                             "can render.")
             return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
-        token = ""
-        path = ""
-        if verts_snapshot and len(verts_snapshot) == (cols_snap + 1) * (rows_snap + 1):
-            import struct
-            import time
-            token = f"{os.getpid()}-{time.time_ns()}"
-            path = os.path.join(GLib.get_tmp_dir(),
-                                f"puppet-warp-verts-{token}.bin")
-            flat = [c for v in verts_snapshot for c in v]
-            try:
-                with open(path, "wb") as fh:
-                    fh.write(token.encode().ljust(64, b"\0"))
-                    fh.write(struct.pack("<III", cols_snap, rows_snap,
-                                         len(verts_snapshot)))
-                    fh.write(struct.pack(f"<{len(flat)}f", *flat))
-            except Exception as e:
-                print(f"[puppet-warp] sidecar write failed: {e}")
-                token = ""
-        pkg = json.loads(params_json)
-        pkg["verts_token"] = token
-        params_json = json.dumps(pkg, separators=(',', ':'), sort_keys=True)
-        apply_filter_to_drawable(drawables[0], params_json)
-        try:
-            Gimp.displays_flush()
-        except Exception:
-            pass
-        if token and path:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        print(f"[puppet-warp] applied filter, pins={pin_count}, sidecar={bool(token)}")
-        if _op_freshly_installed:
-            Gimp.message("Puppet Warp: the GEGL operation was installed into "
-                         f"{GEGL_USER_DIR}.\nRestart GIMP once so the filter "
-                         "can render.")
-        return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
+        finally:
+            _dialog_lock_release(lock)
 
 
 if __name__ == '__main__':
