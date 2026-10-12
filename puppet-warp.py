@@ -1414,7 +1414,7 @@ def remove_filter_from_drawable(drawable):
 
 class PuppetWarpPlugin(Gimp.PlugIn):
     def do_set_i18n(self, procname):
-        return True, 'gimp30-python', None
+        return True, None, None
 
     def do_query_procedures(self):
         return [PLUG_IN_PROC]
