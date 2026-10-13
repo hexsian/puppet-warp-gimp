@@ -8,9 +8,10 @@ are shown (static, not warped) so the preview matches the canvas.
 Cross-platform: builds/loads .so on Linux/macOS and .dll on Windows (MSYS2 /
 MinGW-w64 toolchain with gegl-0.4, glib-2.0, cairo dev packages required).
 D1 (tool-feel dialog): non-modal window so the canvas and Layers dialog stay
-usable while warping; Enter/Space commits and Esc cancels like a GIMP tool;
-window position/size/maximized state persist across sessions; a pidfile
-guard prevents opening a second dialog from another GIMP instance.
+usable while warping; Enter/Space commits and Esc cancels like a GIMP tool; a
+pidfile guard prevents opening a second dialog from another GIMP instance.
+The window size is derived from the warped layer's aspect ratio so the preview
+hugs the subject; no geometry is persisted between sessions.
 Runtime env switches: PW_DEBUG=1 (logs), PW_NO_C_PREVIEW=1 (Python raster),
 PW_NO_BG=1 (no background layer).
 """
@@ -75,7 +76,6 @@ GEGL_USER_DIR = _gegl_user_dir()
 MW_SO = os.path.join(PLUGIN_DIR, _LIB_NAME)      # name kept for history; ext varies
 MW_C = os.path.join(PLUGIN_DIR, "puppet-warp.c")
 AGRID_C = os.path.join(PLUGIN_DIR, "arap_grid.c")
-UI_STATE = os.path.join(PLUGIN_DIR, "ui-state.json")
 DIALOG_PID = os.path.join(GLib.get_tmp_dir(), "puppet-warp-dialog.pid")
 
 _op_ready = False
@@ -295,26 +295,6 @@ def _dialog_lock_release(path):
         pass
 
 
-def _load_ui_state():
-    """Read persisted dialog geometry; None when absent or unreadable."""
-    try:
-        with open(UI_STATE) as fh:
-            st = json.load(fh)
-        return st if isinstance(st, dict) else None
-    except Exception:
-        return None
-
-
-def _save_ui_state(x, y, w, h, maximized):
-    """Persist dialog geometry for the next session."""
-    try:
-        with open(UI_STATE, "w") as fh:
-            json.dump({"x": int(x), "y": int(y), "w": int(w),
-                       "h": int(h), "max": bool(maximized)}, fh)
-    except Exception:
-        pass
-
-
 def ensure_op():
     """One-time init: clean orphans, build binary, load op, load lib."""
     global _op_ready
@@ -327,6 +307,30 @@ def ensure_op():
     _load_arap_lib()
     _op_ready = True
     return True
+
+
+def _hug_default_size(cw, ch):
+    """Window size derived from the layer aspect so the preview hugs the subject.
+    Width = height * (cw/ch); clamped to 85%/80% of the screen for extreme
+    aspects. Returns (win_w, win_h) including toolbar/status/border chrome."""
+    asp = float(cw) / float(ch) if ch else 1.0
+    th = 560
+    tw = int(round(th * asp))
+    try:
+        scr = Gdk.Screen.get_default()
+        mw = int(scr.get_width() * 0.85)
+        mh = int(scr.get_height() * 0.80)
+    except Exception:
+        mw, mh = 1400, 1000
+    if tw > mw:
+        tw = mw
+        th = int(round(tw / asp)) if asp else th
+    if th > mh:
+        th = mh
+        tw = int(round(th * asp))
+    tw = max(240, tw)
+    th = max(200, th)
+    return tw + 12, th + 116          # +chrome: borders + toolbar + status line
 
 
 def _unpack_offsets(t):
@@ -390,19 +394,16 @@ class PuppetWarpDialog(Gtk.Dialog):
         super().__init__(title="Puppet Warp (ARAP)",
                          modal=False,          # D1: canvas/Layers stay usable
                          destroy_with_parent=True)
-        st = _load_ui_state()                  # D1: restore window geometry
-        if st and st.get("w", 0) > 200 and st.get("h", 0) > 150:
-            self.set_default_size(int(st["w"]), int(st["h"]))
-            if st.get("max"):
-                self.maximize()
-            else:
-                self.move(int(st.get("x", 0)), int(st.get("y", 0)))
-        else:
-            self.set_default_size(1000, 780)
         self.image = image
         self.drawable = drawable
         cw = drawable.get_width()
         ch = drawable.get_height()
+
+        # Window size is recomputed from THIS layer's aspect every open; nothing
+        # is persisted, so a previously-wide window can never leak into a new one.
+        ww, wh = _hug_default_size(cw, ch)
+        self.set_default_size(ww, wh)
+
         self.pad_left = 0
         self.pad_top = 0
         self.canvas_w = cw
@@ -625,13 +626,13 @@ class PuppetWarpDialog(Gtk.Dialog):
         return w
 
     def _build_ui(self):
-        """Construct toolbar, drawing area and status hint."""
+        """Toolbar (no title label) + drawing area + status hint. The drawing
+        area has NO fixed size request: the window hugs the layer aspect, so a
+        hard minimum would reintroduce dead side margins."""
         ca = self.get_content_area()
-        ca.set_spacing(6)
-        ca.set_border_width(8)
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        bar.pack_start(Gtk.Label(label="<b>Puppet Warp (ARAP)</b>",
-                                 use_markup=True), False, False, 0)
+        ca.set_spacing(3)
+        ca.set_border_width(4)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         bar.pack_start(Gtk.Label(label="Cols:"), False, False, 0)
         self.cols_spin = Gtk.SpinButton.new_with_range(2, 64, 1)
         self.cols_spin.set_value(self.cols)
@@ -675,7 +676,6 @@ class PuppetWarpDialog(Gtk.Dialog):
         ca.pack_start(bar, False, False, 0)
         self.drawing_area = Gtk.DrawingArea()
         self.drawing_area.set_can_focus(True)
-        self.drawing_area.set_size_request(720, 520)
         self.drawing_area.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
             Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK |
@@ -697,9 +697,12 @@ class PuppetWarpDialog(Gtk.Dialog):
                   "Orange ring: drag dot = rotate | Alt+wheel: rotate | "
                   "Ctrl+wheel: scale | Double-click ring: clear sim | "
                   "Uncheck Rotate/Scale: disable (values kept) | "
-                  "Ctrl+Z / Ctrl+Shift+Z: undo/redo | "
-                  "Enter/Space: apply | Esc: cancel")
+                  "Ctrl+Z / Ctrl+Shift+Z: undo/redo | Enter/Space: apply | "
+                  "Esc: cancel")
+        self.status_label.set_line_wrap(True)
+        self.status_label.set_max_width_chars(64)
         self.status_label.set_xalign(0.0)
+        self.status_label.set_hexpand(False)
         ca.pack_start(self.status_label, False, False, 0)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
         self.add_button("_OK", Gtk.ResponseType.OK)
@@ -1200,12 +1203,15 @@ class PuppetWarpDialog(Gtk.Dialog):
         self.drawing_area.queue_draw()
 
     def fit_to_view(self):
-        """Zoom/pan so the whole canvas fits the drawing area."""
+        """Zoom/pan so the whole canvas fills the drawing area with a small
+        breathing margin. Because the window aspect matches the layer aspect,
+        neither dimension leaves a large dead band."""
         a = self.drawing_area.get_allocation()
-        dw = a.width if a.width > 50 else 720
-        dh = a.height if a.height > 50 else 520
-        self.zoom = min((dw - 80) / float(self.canvas_w),
-                        (dh - 80) / float(self.canvas_h), 2.0)
+        asp = float(self.canvas_w) / float(self.canvas_h) if self.canvas_h else 1.0
+        dw = a.width if a.width > 50 else int(round(560 * asp))
+        dh = a.height if a.height > 50 else 560
+        self.zoom = min((dw - 20) / float(self.canvas_w),
+                        (dh - 20) / float(self.canvas_h), 2.0)
         self.pan_x = (dw - self.canvas_w * self.zoom) / 2.0
         self.pan_y = (dh - self.canvas_h * self.zoom) / 2.0
         self.drawing_area.queue_draw()
@@ -1513,16 +1519,22 @@ class PuppetWarpPlugin(Gimp.PlugIn):
         return proc
 
     def run(self, procedure, run_mode, image, drawables, config, data):
+        # Every failure path returns CANCEL with no GError: constructing
+        # GLib.Error("...") was the source of the "domain != 0" assertion, and
+        # these branches are unreachable via the menu anyway (it is only
+        # sensitive with exactly one drawable, in interactive mode).
         if len(drawables) != 1 or not isinstance(drawables[0], Gimp.Drawable):
-            return procedure.new_return_values(
-                Gimp.PDBStatusType.CALLING_ERROR,
-                GLib.Error("Need exactly one drawable."))
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
         if run_mode == Gimp.RunMode.NONINTERACTIVE:
-            return procedure.new_return_values(
-                Gimp.PDBStatusType.CALLING_ERROR,
-                GLib.Error("Interactive only."))
-        ensure_op()
-        GimpUi.init(PLUG_IN_BINARY)
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
+        try:
+            ensure_op()
+            GimpUi.init(PLUG_IN_BINARY)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[puppet-warp] init failed: {e}")
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
         lock = _dialog_lock_acquire()
         if lock is None:
             Gimp.message("Puppet Warp: the dialog is already open in another "
@@ -1531,7 +1543,9 @@ class PuppetWarpPlugin(Gimp.PlugIn):
         try:
             try:
                 dlg = PuppetWarpDialog(image, drawables[0])
-            except RuntimeError as e:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 Gimp.message("Puppet Warp: " + str(e))
                 return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
             GimpUi.window_set_transient(dlg)
@@ -1540,12 +1554,6 @@ class PuppetWarpPlugin(Gimp.PlugIn):
             pin_count = len(dlg.pins)
             verts_snapshot = list(dlg.deformed_verts or [])
             cols_snap, rows_snap = dlg.cols, dlg.rows
-            try:                                   # D1: persist window geometry
-                gx, gy = dlg.get_position()
-                gw, gh = dlg.get_size()
-                _save_ui_state(gx, gy, gw, gh, dlg.is_maximized())
-            except Exception:
-                pass
             dlg.destroy()
             if resp != Gtk.ResponseType.OK:
                 return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
@@ -1593,6 +1601,14 @@ class PuppetWarpPlugin(Gimp.PlugIn):
                              f"{GEGL_USER_DIR}. Restart GIMP once so the filter "
                              "can render.")
             return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
+        except Exception as e:
+            # Last-resort net: a Python exception escaping here is exactly what
+            # produced "no return values, shouldn't happen" + the teardown
+            # g_error_new warning. Catching it keeps the binding well-formed.
+            import traceback
+            traceback.print_exc()
+            print(f"[puppet-warp] run failed: {e}")
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
         finally:
             _dialog_lock_release(lock)
 
