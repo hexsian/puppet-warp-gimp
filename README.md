@@ -51,14 +51,18 @@ editing, and reopen it later — nothing is baked in.
 
 ## Demo
 
-https://github.com/user-attachments/assets/7aa5b27d-8a5c-434b-b70f-2c4b4fb20dce
+
+
+https://github.com/user-attachments/assets/5bd12069-d2a2-4147-b73a-235c6677b966
+
+
 
 ## How to use
 
 The filter appears in two menus:
 
-- **Filters ▸ Deform ▸ Puppet Warp (ARAP)…
-- **Tools ▸ Transform Tools ▸ Puppet Warp (ARAP)…
+- Filters ▸ Deform ▸ Puppet Warp (ARAP)…
+- Tools ▸ Transform Tools ▸ Puppet Warp (ARAP)…
 
 Isolate the part you want to warp onto **its own layer** first — puppet warp
 deforms the whole layer, so a clean cutout gives the cleanest result.
