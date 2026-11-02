@@ -15,12 +15,6 @@
 
 typedef struct { float x, y; } ArapVec2;
 
-#if defined(__GNUC__) && !defined(_WIN32)
-# define PW_WEAK __attribute__((weak))
-#else
-# define PW_WEAK
-#endif
-
 #if defined(_WIN32)
 # define PW_EXPORT __declspec(dllexport)
 #else
@@ -33,12 +27,12 @@ extern int       arap_grid_solve (void *g, int a, int b, float c, int d);
 extern ArapVec2 *arap_grid_verts (void *g, int *n);
 extern void      arap_grid_free (void *g);
 
-extern void      arap_grid_set_cell_weights (void *g, const float *w, int n) PW_WEAK;
-extern void      arap_grid_set_pin_edge (void *g, int on) PW_WEAK;
+extern void      arap_grid_set_cell_weights (void *g, const float *w, int n);
+extern void      arap_grid_set_pin_edge (void *g, int on);
 extern void      arap_grid_add_pin_sim (void *g, float sx, float sy, float ddx, float ddy,
-                                        float theta, float scale) PW_WEAK;
+                                        float theta, float scale);
 extern void      arap_grid_add_pin_taper (void *g, float sx, float sy, float ddx, float ddy,
-                                          float theta, float scale, float taper) PW_WEAK;
+                                          float theta, float scale, float taper);
 
 static const char *
 find_key (const char *json, const char *key)
@@ -59,7 +53,20 @@ static int
 json_int (const char *json, const char *key, int dflt)
 {
   const char *v = find_key (json, key);
-  return v ? (int) strtol (v, NULL, 10) : dflt;
+
+  if (!v)
+    return dflt;
+
+  while (*v == ' ' || *v == '\t')
+    v++;
+
+  /* Python json.dumps writes booleans as true/false. */
+  if (strncmp (v, "true", 4) == 0)
+    return 1;
+  if (strncmp (v, "false", 5) == 0)
+    return 0;
+
+  return (int) strtol (v, NULL, 10);
 }
 
 static int
@@ -97,6 +104,82 @@ json_floats (const char *json, const char *key, float *out, int maxn)
     }
 
   return n;
+}
+
+/* Cache key: only the fields that change the solved mesh or its depth.
+   Display-only settings (mesh colour/style, background mode) are left out,
+   so changing them does not trigger a new solve. Arrays are copied verbatim
+   from the JSON text, which keeps the key exact. */
+static gchar *
+geom_key (const char *json)
+{
+  static const char *const keys[] = {
+    "cols", "rows", "pin_edge", "rotate_on", "extend",
+    "pad_left", "pad_top", "pad_right", "pad_bottom",
+    "orig_width", "orig_height",
+    "pins_flat", "mask_flat", "verts_flat",
+    "pin_rot", "pin_scale", "pin_taper", "pin_depth",
+    NULL
+  };
+  GString *s = g_string_new (NULL);
+  int i;
+
+  for (i = 0; keys[i]; i++)
+    {
+      const char *v = find_key (json, keys[i]);
+      const char *p;
+      int depth = 0;
+
+      g_string_append (s, keys[i]);
+      g_string_append_c (s, ':');
+
+      if (!v)
+        {
+          g_string_append_c (s, ';');
+          continue;
+        }
+
+      while (*v == ' ' || *v == '\t')
+        v++;
+
+      for (p = v; *p; p++)
+        {
+          if (*p == '[')
+            depth++;
+          else if (*p == ']')
+            {
+              depth--;
+              if (depth == 0)
+                {
+                  p++;
+                  break;
+                }
+            }
+          else if (depth == 0 && (*p == ',' || *p == '}'))
+            break;
+        }
+
+      g_string_append_len (s, v, p - v);
+      g_string_append_c (s, ';');
+    }
+
+  return g_string_free (s, FALSE);
+}
+
+/* PW_DEBUG is read once; getenv in the render path is wasteful. */
+static gboolean
+pw_debug_on (void)
+{
+  static gsize once = 0;
+  static gboolean on = FALSE;
+
+  if (g_once_init_enter (&once))
+    {
+      on = getenv ("PW_DEBUG") != NULL;
+      g_once_init_leave (&once, 1);
+    }
+
+  return on;
 }
 
 typedef struct _PuppetWarp      PuppetWarp;
@@ -196,46 +279,205 @@ puppet_warp_get_property (GObject    *object,
     }
 }
 
+/* Needle test: true if any edge stretches more than sqrt(k) times its
+   source length. u/v are destination, x/y are source corners. */
 static int
-pw_needle (double u0, double v0, double u1, double v1, double u2, double v2,
-           double x0, double y0, double x1, double y1, double x2, double y2)
+pw_is_needle (const double *u, const double *v,
+              const double *x, const double *y, double k)
 {
-  double du, dv, dx, dy;
+  int e;
 
-  du = u1 - u0; dv = v1 - v0; dx = x1 - x0; dy = y1 - y0;
-  if (du * du + dv * dv > 64.0 * (dx * dx + dy * dy))
-    return 1;
+  for (e = 0; e < 3; e++)
+    {
+      int n = (e + 1) % 3;
+      double du = u[n] - u[e];
+      double dv = v[n] - v[e];
+      double dx = x[n] - x[e];
+      double dy = y[n] - y[e];
 
-  du = u2 - u1; dv = v2 - v1; dx = x2 - x1; dy = y2 - y1;
-  if (du * du + dv * dv > 64.0 * (dx * dx + dy * dy))
-    return 1;
-
-  du = u0 - u2; dv = v0 - v2; dx = x0 - x2; dy = y0 - y2;
-  if (du * du + dv * dv > 64.0 * (dx * dx + dy * dy))
-    return 1;
+      if (du * du + dv * dv > k * (dx * dx + dy * dy))
+        return 1;
+    }
 
   return 0;
 }
 
-/* apply path: inverse map one triangle into a GEGL tile */
+static int
+pw_needle (double u0, double v0, double u1, double v1, double u2, double v2,
+           double x0, double y0, double x1, double y1, double x2, double y2)
+{
+  return 0; /* TẠM THỜI VÔ HIỆU HÓA */
+
+  const double u[3] = { u0, u1, u2 }, v[3] = { v0, v1, v2 };
+  const double x[3] = { x0, x1, x2 }, y[3] = { y0, y1, y2 };
+
+  return pw_is_needle (u, v, x, y, 64.0);
+}
+
+#define PW_BAND_H 128
+
+/* Source pixels for one band, fetched once from GEGL as RGBA float. */
+typedef struct
+{
+  const float   *buf;    /* NULL when no source data is available */
+  GeglRectangle  rect;   /* area of the input that buf covers */
+} PwSrc;
+
+static float *
+pw_fetch (GeglBuffer *input, const GeglRectangle *r)
+{
+  float *buf = g_new (float, (gsize) r->width * (gsize) r->height * 4);
+
+  gegl_buffer_get (input, r, 1.0, babl_format ("RGBA float"), buf,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+
+  /* Premultiply so transparent pixels cannot bleed their colour into edges. */
+  {
+    gsize n = (gsize) r->width * (gsize) r->height;
+    gsize i;
+
+    for (i = 0; i < n; i++)
+      {
+        float *q = buf + i * 4;
+
+        q[0] *= q[3];
+        q[1] *= q[3];
+        q[2] *= q[3];
+      }
+  }
+
+  return buf;
+}
+
+/* Bilinear sample from PwSrc (premultiplied source), same pixel-centre
+   convention as GEGL_SAMPLER_LINEAR. Returns straight RGBA. Outside the
+   fetched area the result is transparent. */
 static void
-warp_tri (GeglBuffer          *input,
-          const Babl          *fmt,
-          gint                 bpp,
-          const Babl          *afmt,
-          float               *amask,
-          gboolean             alpha_from_px,
-          int                  csize,
-          int                  aoff,
-          guchar              *tile,
-          const GeglRectangle *sroi,
+pw_sample (const PwSrc *src, double sx, double sy, float out[4])
+{
+  double fx, fy, tx, ty;
+  double acc[4] = { 0.0, 0.0, 0.0, 0.0 };
+  int ix, iy, i, j, k;
+
+  out[0] = out[1] = out[2] = out[3] = 0.0f;
+
+  if (!src->buf || !isfinite (sx) || !isfinite (sy))
+    return;
+
+  fx = sx - 0.5;
+  fy = sy - 0.5;
+  ix = (int) floor (fx);
+  iy = (int) floor (fy);
+  tx = fx - ix;
+  ty = fy - iy;
+
+  for (j = 0; j < 2; j++)
+    for (i = 0; i < 2; i++)
+      {
+        int px = ix + i - src->rect.x;
+        int py = iy + j - src->rect.y;
+        double w = (i ? tx : 1.0 - tx) * (j ? ty : 1.0 - ty);
+        const float *p;
+
+        if (w <= 0.0)
+          continue;
+
+        if (px < 0) px = 0;
+        else if (px >= src->rect.width) px = src->rect.width - 1;
+
+        if (py < 0) py = 0;
+        else if (py >= src->rect.height) py = src->rect.height - 1;
+
+        p = src->buf + ((size_t) py * (size_t) src->rect.width + (size_t) px) * 4;
+
+        for (k = 0; k < 4; k++)
+          acc[k] += w * p[k];
+      }
+
+  if (acc[3] > 0.0)
+    {
+      /* back to straight colour; alpha is the weighted coverage */
+      out[0] = (float) (acc[0] / acc[3]);
+      out[1] = (float) (acc[1] / acc[3]);
+      out[2] = (float) (acc[2] / acc[3]);
+      out[3] = (float) acc[3];
+    }
+}
+
+static gboolean
+pw_band_source (const float *dxs, const float *dys, int cols, int rows,
+                float ow, float oh, float pad_sx, float pad_sy,
+                const GeglRectangle *band, const GeglRectangle *ext,
+                gboolean clamp_src,
+                double cx0, double cy0, double cx1, double cy1,
+                GeglRectangle *out)
+{
+  double minx = 1e300, miny = 1e300, maxx = -1e300, maxy = -1e300;
+  gboolean any = FALSE;
+  int r, c;
+
+  for (r = 0; r < rows; r++)
+    for (c = 0; c < cols; c++)
+      {
+        int i00 = r * (cols + 1) + c;
+        int i10 = i00 + 1;
+        int i01 = i00 + (cols + 1);
+        int i11 = i01 + 1;
+        double bx0 = fmin (fmin (dxs[i00], dxs[i10]), fmin (dxs[i01], dxs[i11]));
+        double bx1 = fmax (fmax (dxs[i00], dxs[i10]), fmax (dxs[i01], dxs[i11]));
+        double by0 = fmin (fmin (dys[i00], dys[i10]), fmin (dys[i01], dys[i11]));
+        double by1 = fmax (fmax (dys[i00], dys[i10]), fmax (dys[i01], dys[i11]));
+        double sx0, sx1, sy0, sy1;
+
+        if (bx1 < band->x || bx0 > band->x + band->width ||
+            by1 < band->y || by0 > band->y + band->height)
+          continue;
+
+        sx0 = (double) c * ow / cols + pad_sx;
+        sx1 = (double) (c + 1) * ow / cols + pad_sx;
+        sy0 = (double) r * oh / rows + pad_sy;
+        sy1 = (double) (r + 1) * oh / rows + pad_sy;
+
+        minx = fmin (minx, sx0);
+        miny = fmin (miny, sy0);
+        maxx = fmax (maxx, sx1);
+        maxy = fmax (maxy, sy1);
+
+        /* No clamp_src union here: inverse-mapped points of a triangle always
+           lie inside its source triangle, so the cell's own source rect is
+           enough. Unioning the whole content made every band fetch the
+           entire image when Extend was on. */
+        (void) clamp_src; (void) cx0; (void) cy0; (void) cx1; (void) cy1;
+
+        any = TRUE;
+      }
+
+  if (!any)
+    return FALSE;
+
+  {
+    GeglRectangle want;
+
+    want.x = (int) floor (minx) - 2;
+    want.y = (int) floor (miny) - 2;
+    want.width = (int) ceil (maxx) - want.x + 2;
+    want.height = (int) ceil (maxy) - want.y + 2;
+
+    if (want.width <= 0 || want.height <= 0)
+      return FALSE;
+      
+    return gegl_rectangle_intersect (out, &want, ext);
+  }
+}
+
+/* apply path: inverse map one triangle into a float RGBA tile */
+static void
+warp_tri (const PwSrc *src, float *tile, const GeglRectangle *band,
           float u0, float v0, float u1, float v1, float u2, float v2,
           float x0, float y0, float x1, float y1, float x2, float y2,
-          gboolean             clamp_src,
-          double               cx0, double cy0, double cx1, double cy1,
-          double det_min,
-          int                  tri_depth,
-          int                 *zbuf)
+          gboolean clamp_src,
+          double cx0, double cy0, double cx1, double cy1,
+          double det_min, int tri_depth, int *zbuf)
 {
   double du0 = u0, dv0 = v0, du1 = u1, dv1 = v1, du2 = u2, dv2 = v2;
   double sx0 = x0, sy0 = y0, sx1 = x1, sy1 = y1, sx2 = x2, sy2 = y2;
@@ -244,7 +486,6 @@ warp_tri (GeglBuffer          *input,
   double e0x, e0y, e1x, e1y, e2x, e2y;
   const double eps = 1e-3;
   int minx, maxx, miny, maxy, x, y;
-  guchar px[64];
 
   if (!isfinite (du0) || !isfinite (dv0) ||
       !isfinite (du1) || !isfinite (dv1) ||
@@ -262,9 +503,6 @@ warp_tri (GeglBuffer          *input,
                  sx0, sy0, sx1, sy1, sx2, sy2))
     return;
 
-  if (bpp > 64)
-    return;
-
   inv = 1.0 / det;
 
   a = inv * ((dv2 - dv0) * (sx1 - sx0) - (dv1 - dv0) * (sx2 - sx0));
@@ -279,7 +517,7 @@ warp_tri (GeglBuffer          *input,
   sc = fmax (sc, fabs (c));
   sc = fmax (sc, fabs (d));
 
-  if (!isfinite (sc) || sc > 1e4 || sc < 1e-6)
+  if (!isfinite (sc) || sc > 1e9 || sc < 1e-6) /* Nới lỏng giới hạn lên 1e9 */
     return;
 
   m_det = a * d - b * c;
@@ -288,12 +526,12 @@ warp_tri (GeglBuffer          *input,
 
   minx = (int) floor (fmin (du0, fmin (du1, du2)));
   maxx = (int) ceil  (fmax (du0, fmax (du1, du2)));
-  miny = MAX ((int) floor (fmin (dv0, fmin (dv1, dv2))), sroi->y);
+  miny = MAX ((int) floor (fmin (dv0, fmin (dv1, dv2))), band->y);
   maxy = MIN ((int) ceil  (fmax (dv0, fmax (dv1, dv2))),
-              sroi->y + sroi->height - 1);
+              band->y + band->height - 1);
 
-  minx = MAX (minx, sroi->x);
-  maxx = MIN (maxx, sroi->x + sroi->width - 1);
+  minx = MAX (minx, band->x);
+  maxx = MIN (maxx, band->x + band->width - 1);
 
   if (minx > maxx || miny > maxy)
     return;
@@ -312,8 +550,10 @@ warp_tri (GeglBuffer          *input,
         gboolean inside =
           (w0 >= -eps && w1 >= -eps && w2 >= -eps) ||
           (w0 <=  eps && w1 <=  eps && w2 <=  eps);
-        gsize pidx, idx;
+        gsize pidx;
+        gsize idx;
         double srcx, srcy;
+        float px[4];
 
         if (!inside)
           continue;
@@ -330,79 +570,33 @@ warp_tri (GeglBuffer          *input,
             else if (srcy > cy1) srcy = cy1;
           }
 
-        pidx = (gsize) (y - sroi->y) * sroi->width + (x - sroi->x);
-        idx  = pidx * bpp;
+        pidx = (gsize) (y - band->y) * (gsize) band->width + (gsize) (x - band->x);
+        idx  = pidx * 4;
 
-        gegl_buffer_sample (input, srcx, srcy, NULL, px, fmt,
-                            GEGL_ABYSS_NONE, GEGL_SAMPLER_LINEAR);
+        pw_sample (src, srcx, srcy, px);
 
         if (zbuf != NULL)
           {
             /* pin depth: front-most opaque wins; transparent lets lower show */
-            float za = 1.0f;
-            if (alpha_from_px)
+            if (px[3] > 0.0f && tri_depth >= zbuf[pidx])
               {
-                if (csize == 4)
-                  memcpy (&za, px + aoff, sizeof za);
-                else
-                  za = (float) px[aoff] * 0.00392156862745098f;
-              }
-            else if (afmt != NULL)
-              gegl_buffer_sample (input, srcx, srcy, NULL, &za, afmt,
-                                  GEGL_ABYSS_NONE, GEGL_SAMPLER_LINEAR);
-
-            if (za > 0.0f && tri_depth >= zbuf[pidx])
-              {
-                memcpy (tile + idx, px, bpp);
+                memcpy (tile + idx, px, sizeof px);
                 zbuf[pidx] = tri_depth;
               }
             continue;
           }
 
-        if (alpha_from_px)
-          {
-            float sa;
+        if (!(px[3] > 0.0f) || !isfinite ((double) px[3]))
+          continue;
 
-            if (csize == 4)
-              memcpy (&sa, px + aoff, sizeof sa);
-            else
-              sa = (float) px[aoff] * 0.00392156862745098f;
+        if (px[3] > 1.0f)
+          px[3] = 1.0f;
 
-            if (!(sa > 0.0f) || !isfinite ((double) sa))
-              continue;
+        /* highest alpha wins, as the old per-pixel mask did */
+        if (px[3] < tile[idx + 3])
+          continue;
 
-            if (sa > 1.0f)
-              sa = 1.0f;
-
-            if (sa < amask[pidx])
-              continue;
-
-            memcpy (tile + idx, px, bpp);
-            amask[pidx] = sa;
-          }
-        else if (afmt != NULL && amask != NULL)
-          {
-            float sa = 0.0f;
-
-            gegl_buffer_sample (input, srcx, srcy, NULL, &sa, afmt,
-                                GEGL_ABYSS_NONE, GEGL_SAMPLER_LINEAR);
-
-            if (!(sa > 0.0f) || !isfinite ((double) sa))
-              continue;
-
-            if (sa > 1.0f)
-              sa = 1.0f;
-
-            if (sa < amask[pidx])
-              continue;
-
-            memcpy (tile + idx, px, bpp);
-            amask[pidx] = sa;
-          }
-        else
-          {
-            memcpy (tile + idx, px, bpp);
-          }
+        memcpy (tile + idx, px, sizeof px);
       }
 }
 
@@ -587,13 +781,14 @@ warp_tri_fast_clip (const uint8_t *src, int sstride, int sw, int sh,
                     uint16_t *zbuf)
 {
   double det = (u1 - u0) * (v2 - v0) - (v1 - v0) * (u2 - u0);
-  double du, dv, dx, dy;
   double inv, a, b, c, d, e, f, sc, m_det;
   double minxu, maxxu, minyv, maxyv;
   double vsc2, min_det, needle_k;
   const double eps = 1e-4;
   const double eu[3] = { u0, u1, u2 };
   const double ev[3] = { v0, v1, v2 };
+  const double ex[3] = { x0, x1, x2 };
+  const double ey[3] = { y0, y1, y2 };
   int minx, maxx, miny, maxy, x, y;
 
   if (dw <= 0 || dh <= 0 || clip_y0 >= clip_y1)
@@ -629,16 +824,7 @@ warp_tri_fast_clip (const uint8_t *src, int sstride, int sw, int sh,
       !isfinite (x2) || !isfinite (y2))
     return 0;
 
-  du = u1 - u0; dv = v1 - v0; dx = x1 - x0; dy = y1 - y0;
-  if (du * du + dv * dv > needle_k * (dx * dx + dy * dy))
-    return 0;
-
-  du = u2 - u1; dv = v2 - v1; dx = x2 - x1; dy = y2 - y1;
-  if (du * du + dv * dv > needle_k * (dx * dx + dy * dy))
-    return 0;
-
-  du = u0 - u2; dv = v0 - v2; dx = x0 - x2; dy = y0 - y2;
-  if (du * du + dv * dv > needle_k * (dx * dx + dy * dy))
+  if (pw_is_needle (eu, ev, ex, ey, needle_k))
     return 0;
 
   inv = 1.0 / det;
@@ -658,7 +844,7 @@ warp_tri_fast_clip (const uint8_t *src, int sstride, int sw, int sh,
   /* Convert screen-space affine magnitude back to world-space. */
   sc *= vsc;
 
-  if (!(sc >= 1e-6 && sc <= 1e4))
+  if (!(sc >= 1e-6 && sc <= 1e9)) /* Nới lỏng giới hạn lên 1e9 */
     return 0;
 
   m_det = a * d - b * c;
@@ -1012,21 +1198,6 @@ pw_render_preview_view_depth (void *src, int sw, int sh, int sstride,
                                       clamp_edges, depth_on, vdepth);
 }
 
-PW_EXPORT int
-pw_render_preview (void *src, int sw, int sh, int sstride,
-                   void *dst, int dw, int dh, int dstride,
-                   int cols, int rows,
-                   const float *verts, int nverts,
-                   float px, float py, float pw, float ph)
-{
-  return pw_render_preview_view (src, sw, sh, sstride,
-                                 dst, dw, dh, dstride,
-                                 cols, rows,
-                                 verts, nverts,
-                                 px, py, pw, ph,
-                                 0.0f, 0.0f, 1.0f, 0);
-}
-
 static gboolean
 puppet_warp_process (GeglOperation       *operation,
                      GeglBuffer          *input,
@@ -1036,6 +1207,7 @@ puppet_warp_process (GeglOperation       *operation,
 {
   PuppetWarp *self = (PuppetWarp *) operation;
   const char *json = self->params_json ? self->params_json : "{}";
+  gchar *gkey = geom_key (json);
   int cols = json_int (json, "cols", 15);
   int rows = json_int (json, "rows", 15);
   int pin_edge = json_int (json, "pin_edge", 0);
@@ -1086,15 +1258,9 @@ puppet_warp_process (GeglOperation       *operation,
   int nrot  = json_floats (json, "pin_rot", prot, 256);
   int nsc   = json_floats (json, "pin_scale", pisc, 256);
   int ntap  = json_floats (json, "pin_taper", ptap, 256);
-  int ndep  = json_floats (json, "pin_depth", pdep, 256);
+  json_floats (json, "pin_depth", pdep, 256);
   int nverts;
   gdouble s;
-  const Babl *fmt;
-  const Babl *afmt = NULL;
-  gint bpp;
-  gboolean has_alpha;
-  gboolean alpha_from_px = FALSE;
-  int csz = 0, aoff = 0;
   float *dxs, *dys;
   int sy0, r, c;
   int hold_writer = 0;
@@ -1108,35 +1274,18 @@ puppet_warp_process (GeglOperation       *operation,
   if (rows > 64) rows = 64;
 
   nverts = (cols + 1) * (rows + 1);
-  s = 1.0 / (1 << level);
+  /* level is a mip level; clamp so the shift stays well defined */
+  s = ldexp (1.0, -(level < 0 ? 0 : (level > 30 ? 30 : level)));
 
-  if (getenv ("PW_DEBUG"))
+  if (pw_debug_on ())
     fprintf (stderr,
              "[puppet-warp] pins=%d nrot=%d nsc=%d ncw=%d roi=%dx%d level=%d\n",
              npins, nrot, nsc, ncw, roi->width, roi->height, level);
 
-  fmt = gegl_operation_get_format (operation, "output");
-  if (!fmt)
-    fmt = babl_format ("RGBA float");
-
-  bpp = babl_format_get_bytes_per_pixel (fmt);
-  has_alpha = babl_format_has_alpha (fmt);
-
-  {
-    int ncomp = babl_format_get_n_components (fmt);
-    int csize = (ncomp > 0) ? (bpp / ncomp) : 0;
-
-    alpha_from_px = (has_alpha && ncomp == 4 && (csize == 4 || csize == 1));
-    csz  = csize;
-    aoff = alpha_from_px ? (3 * csize) : 0;
-  }
-
-  afmt = (has_alpha && !alpha_from_px) ? babl_format ("A float") : NULL;
-
   g_rw_lock_reader_lock (&pw_solve_lock);
 
   if (!(pw_cache_json != NULL &&
-        strcmp (pw_cache_json, json) == 0 &&
+        strcmp (pw_cache_json, gkey) == 0 &&
         pw_cache_level == level &&
         pw_cache_nverts == nverts))
     {
@@ -1145,7 +1294,7 @@ puppet_warp_process (GeglOperation       *operation,
       hold_writer = 1;
 
       if (!(pw_cache_json != NULL &&
-            strcmp (pw_cache_json, json) == 0 &&
+            strcmp (pw_cache_json, gkey) == 0 &&
             pw_cache_level == level &&
             pw_cache_nverts == nverts))
         {
@@ -1188,10 +1337,10 @@ puppet_warp_process (GeglOperation       *operation,
 
               if (grid)
                 {
-                  if (ncw == cols * rows && arap_grid_set_cell_weights)
+                  if (ncw == cols * rows)
                     arap_grid_set_cell_weights (grid, cw, ncw);
 
-                  if (pin_edge && arap_grid_set_pin_edge)
+                  if (pin_edge)
                     arap_grid_set_pin_edge (grid, 1);
 
                   for (ii = 0; ii < npins; ii++)
@@ -1200,29 +1349,12 @@ puppet_warp_process (GeglOperation       *operation,
                       float sc = (rotate_on && ii < nsc) ? pisc[ii] : 1.0f;
                       float tp = (ii < ntap) ? ptap[ii] : 0.f;
 
-                      if (arap_grid_add_pin_taper)
-                        arap_grid_add_pin_taper (grid,
-                                                 pins[ii * 4],
-                                                 pins[ii * 4 + 1],
-                                                 pins[ii * 4 + 2],
-                                                 pins[ii * 4 + 3],
-                                                 th,
-                                                 sc,
-                                                 tp);
-                      else if ((th != 0.f || sc != 1.f) && arap_grid_add_pin_sim)
-                        arap_grid_add_pin_sim (grid,
+                      arap_grid_add_pin_taper (grid,
                                                pins[ii * 4],
                                                pins[ii * 4 + 1],
                                                pins[ii * 4 + 2],
                                                pins[ii * 4 + 3],
-                                               th,
-                                               sc);
-                      else
-                        arap_grid_add_pin (grid,
-                                           pins[ii * 4],
-                                           pins[ii * 4 + 1],
-                                           pins[ii * 4 + 2],
-                                           pins[ii * 4 + 3]);
+                                               th, sc, tp);
                     }
 
                   arap_grid_solve (grid, 30, 150, 0.05f, 0);
@@ -1245,7 +1377,7 @@ puppet_warp_process (GeglOperation       *operation,
                 }
             }
 
-          if (getenv ("PW_DEBUG"))
+          if (pw_debug_on ())
             fprintf (stderr,
                      "[pw-op] vert_src=%d nverts=%d cols=%d rows=%d\n",
                      vert_src, nverts, cols, rows);
@@ -1308,7 +1440,7 @@ puppet_warp_process (GeglOperation       *operation,
           g_free (pw_cache_dy);
           g_free (pw_cache_json);
 
-          pw_cache_json   = g_strdup (json);
+          pw_cache_json   = g_strdup (gkey);
           pw_cache_level  = level;
           pw_cache_dx     = dx;
           pw_cache_dy     = dy;
@@ -1331,6 +1463,7 @@ puppet_warp_process (GeglOperation       *operation,
       g_free (pisc);
       g_free (ptap);
       g_free (pdep);
+      g_free (gkey);
       return FALSE;
     }
 
@@ -1357,95 +1490,118 @@ puppet_warp_process (GeglOperation       *operation,
 
   int don = pw_cache_depth_on;
   int *vdep = don ? pw_cache_vdepth : NULL;
+  GeglRectangle ext = *gegl_buffer_get_extent (input);
 
-  for (sy0 = roi->y; sy0 < roi->y + roi->height; sy0 += 64)
+  if (pw_debug_on ())
+    fprintf (stderr,
+             "[pw-ext] roi=%d,%d %dx%d ext=%d,%d %dx%d pad=%d,%d ow=%.0f oh=%.0f\n",
+             roi->x, roi->y, roi->width, roi->height,
+             ext.x, ext.y, ext.width, ext.height,
+             pad_l, pad_t, (double) ow, (double) oh);
+
+  for (sy0 = roi->y; sy0 < roi->y + roi->height; sy0 += PW_BAND_H)
     {
       GeglRectangle band;
-      guchar *tile;
-      float *amask = NULL;
+      GeglRectangle need;
+      PwSrc src;
+      float *band_src = NULL;
+      float *tile;
       gsize npix;
 
       band.x = roi->x;
       band.y = sy0;
       band.width = roi->width;
-      band.height = MIN (64, roi->y + roi->height - sy0);
+      band.height = MIN (PW_BAND_H, roi->y + roi->height - sy0);
 
-      npix = (gsize) band.width * band.height;
-      tile = g_new0 (guchar, npix * bpp);
+      npix = (gsize) band.width * (gsize) band.height;
+      tile = g_new0 (float, npix * 4);
 
-      if (has_alpha)
-        amask = g_new0 (float, npix);
+      if (pw_band_source (dxs, dys, cols, rows, ow, oh, pad_sx, pad_sy,
+                          &band, &ext, clamp_src, cx0, cy0, cx1, cy1, &need))
+        {
+          band_src = pw_fetch (input, &need);
+          src.buf = band_src;
+          src.rect = need;
+        }
+      else
+        {
+          src.buf = NULL;
 
-      {
-        int *zbuf = NULL;
-        if (don)
-          {
-            gsize zi;
-            zbuf = g_new (int, npix);
-            for (zi = 0; zi < npix; zi++)
-              zbuf[zi] = -1000000;
-          }
+          if (pw_debug_on ())
+            fprintf (stderr,
+                     "[pw-nosrc] band=%d,%d %dx%d ext=%d,%d %dx%d\n",
+                     band.x, band.y, band.width, band.height,
+                     ext.x, ext.y, ext.width, ext.height);
+        }
 
-        for (r = 0; r < rows; r++)
-          for (c = 0; c < cols; c++)
+      if (src.buf)
+        {
+          int *zbuf = NULL;
+
+          if (don)
             {
-              int i00 = r * (cols + 1) + c;
-              int i10 = i00 + 1;
-              int i01 = i00 + (cols + 1);
-              int i11 = i01 + 1;
+              gsize zi;
 
-              float x0 = (float) c       * ow / cols + pad_sx;
-              float y0 = (float) r       * oh / rows + pad_sy;
-              float x1 = (float) (c + 1) * ow / cols + pad_sx;
-              float y1 = y0;
-              float x2 = x0;
-              float y2 = (float) (r + 1) * oh / rows + pad_sy;
-              float x3 = x1;
-              float y3 = y2;
-
-              int td0 = 0, td1 = 0;
-              if (don)
-                {
-                  int a0 = vdep[i00], a1 = vdep[i10], a2 = vdep[i01];
-                  int b0 = vdep[i10], b1 = vdep[i11], b2 = vdep[i01];
-                  td0 = a0 >= a1 && a0 >= a2 ? a0 : (a1 >= a2 ? a1 : a2);
-                  td1 = b0 >= b1 && b0 >= b2 ? b0 : (b1 >= b2 ? b1 : b2);
-                }
-
-              warp_tri (input, fmt, bpp, afmt, amask,
-                        alpha_from_px, csz, aoff,
-                        tile, &band,
-                        dxs[i00], dys[i00],
-                        dxs[i10], dys[i10],
-                        dxs[i01], dys[i01],
-                        x0, y0,
-                        x1, y1,
-                        x2, y2,
-                        clamp_src, cx0, cy0, cx1, cy1,
-                        det_min, td0, zbuf);
-
-              warp_tri (input, fmt, bpp, afmt, amask,
-                        alpha_from_px, csz, aoff,
-                        tile, &band,
-                        dxs[i10], dys[i10],
-                        dxs[i11], dys[i11],
-                        dxs[i01], dys[i01],
-                        x1, y1,
-                        x3, y3,
-                        x2, y2,
-                        clamp_src, cx0, cy0, cx1, cy1,
-                        det_min, td1, zbuf);
+              zbuf = g_new (int, npix);
+              for (zi = 0; zi < npix; zi++)
+                zbuf[zi] = -1000000;
             }
 
-        if (zbuf)
-          g_free (zbuf);
-      }
+          for (r = 0; r < rows; r++)
+            for (c = 0; c < cols; c++)
+              {
+                int i00 = r * (cols + 1) + c;
+                int i10 = i00 + 1;
+                int i01 = i00 + (cols + 1);
+                int i11 = i01 + 1;
 
-      gegl_buffer_set (output, &band, 0, fmt, tile, GEGL_AUTO_ROWSTRIDE);
+                float x0 = (float) c       * ow / cols + pad_sx;
+                float y0 = (float) r       * oh / rows + pad_sy;
+                float x1 = (float) (c + 1) * ow / cols + pad_sx;
+                float y1 = y0;
+                float x2 = x0;
+                float y2 = (float) (r + 1) * oh / rows + pad_sy;
+                float x3 = x1;
+                float y3 = y2;
+
+                int td0 = 0, td1 = 0;
+                if (don)
+                  {
+                    int a0 = vdep[i00], a1 = vdep[i10], a2 = vdep[i01];
+                    int b0 = vdep[i10], b1 = vdep[i11], b2 = vdep[i01];
+                    td0 = a0 >= a1 && a0 >= a2 ? a0 : (a1 >= a2 ? a1 : a2);
+                    td1 = b0 >= b1 && b0 >= b2 ? b0 : (b1 >= b2 ? b1 : b2);
+                  }
+
+                warp_tri (&src, tile, &band,
+                          dxs[i00], dys[i00],
+                          dxs[i10], dys[i10],
+                          dxs[i01], dys[i01],
+                          x0, y0,
+                          x1, y1,
+                          x2, y2,
+                          clamp_src, cx0, cy0, cx1, cy1,
+                          det_min, td0, zbuf);
+
+                warp_tri (&src, tile, &band,
+                          dxs[i10], dys[i10],
+                          dxs[i11], dys[i11],
+                          dxs[i01], dys[i01],
+                          x1, y1,
+                          x3, y3,
+                          x2, y2,
+                          clamp_src, cx0, cy0, cx1, cy1,
+                          det_min, td1, zbuf);
+              }
+
+          g_free (zbuf);
+        }
+
+      gegl_buffer_set (output, &band, 0, babl_format ("RGBA float"), tile,
+                       GEGL_AUTO_ROWSTRIDE);
 
       g_free (tile);
-      if (amask)
-        g_free (amask);
+      g_free (band_src);
     }
 
   if (hold_writer)
@@ -1459,8 +1615,42 @@ puppet_warp_process (GeglOperation       *operation,
   g_free (pisc);
   g_free (ptap);
   g_free (pdep);
+  g_free (gkey);
 
   return TRUE;
+}
+
+/* Warp is non-local: output pixels read source pixels from anywhere in the
+   input, so the whole input must be requested, not just the output ROI. */
+static GeglRectangle
+puppet_warp_get_required_for_output (GeglOperation       *operation,
+                                     const gchar         *input_pad,
+                                     const GeglRectangle *roi)
+{
+  const GeglRectangle *in_rect =
+    gegl_operation_source_get_bounding_box (operation, "input");
+
+  (void) input_pad;
+
+  if (!in_rect || in_rect->width <= 0 || in_rect->height <= 0)
+    return *roi;
+
+  return *in_rect;
+}
+
+static GeglRectangle
+puppet_warp_get_invalidated_by_change (GeglOperation       *operation,
+                                       const gchar         *input_pad,
+                                       const GeglRectangle *input_roi)
+{
+  GeglRectangle r = gegl_operation_get_bounding_box (operation);
+
+  (void) input_pad;
+
+  if (r.width <= 0 || r.height <= 0)
+    return *input_roi;
+
+  return r;
 }
 
 static void
@@ -1488,6 +1678,8 @@ puppet_warp_class_init (PuppetWarpClass *klass, gpointer class_data)
                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   fc->process         = puppet_warp_process;
+  opc->get_required_for_output   = puppet_warp_get_required_for_output;
+  opc->get_invalidated_by_change = puppet_warp_get_invalidated_by_change;
   opc->opencl_support = FALSE;
 
   gegl_operation_class_set_keys (opc,

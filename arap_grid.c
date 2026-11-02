@@ -4,7 +4,6 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
-#include <glib.h>
 
 typedef struct { float x, y; } ArapVec2;
 
@@ -18,6 +17,25 @@ typedef struct { float x, y; } ArapVec2;
 #define ARAP_TAPER_RANGE 3.0f
 
 void arap_grid_free (void *handle);
+
+/* Debug switches, read once in arap_grid_new (not per solve). */
+static int env_debug = 0;
+static int env_prof  = 0;
+
+/* FNV-1a over raw bytes; used to fingerprint the factor inputs. */
+static unsigned long
+fnv_mix (unsigned long h, const void *p, size_t n)
+{
+    const unsigned char *b = p;
+
+    while (n--)
+    {
+        h ^= *b++;
+        h *= 1099511628211UL;
+    }
+
+    return h;
+}
 
 typedef struct {
     int cols, rows, nv, nc, band;
@@ -38,7 +56,6 @@ typedef struct {
     float *sp;
     float *spt;
     int nsim, scap;
-    unsigned long sim_sig;
 
     unsigned char *hard;
     float *accW, *accTX, *accTY;
@@ -59,25 +76,6 @@ typedef struct {
     double *rx, *ry, *xx, *yy;
     ArapVec2 *out;
 } ArapGrid;
-
-static inline unsigned long
-hash_u32 (unsigned int x)
-{
-    x ^= x >> 16;
-    x *= 0x7feb352dU;
-    x ^= x >> 15;
-    x *= 0x846ca68bU;
-    x ^= x >> 16;
-    return (unsigned long)x;
-}
-
-static inline unsigned long
-hash_float (float f)
-{
-    unsigned int u;
-    memcpy (&u, &f, sizeof u);
-    return hash_u32 (u);
-}
 
 static int
 grow_pins (ArapGrid *g, int ncap)
@@ -291,8 +289,10 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
 
     g->w_ver = 1;
     g->pin_edge = 0;
-    g->sim_sig = 0;
     g->acc_dirty = 0;
+
+    env_debug = getenv ("PW_DEBUG") != NULL;
+    env_prof  = getenv ("PW_ARAP_PROF") != NULL;
     g->acc_max = 0.0f;
 
     return g;
@@ -347,7 +347,6 @@ arap_grid_reset_pins (void *handle)
 
     g->npin = 0;
     g->nsim = 0;
-    g->sim_sig = 0;
     g->acc_dirty = 0;
     g->acc_max = 0.0f;
 }
@@ -378,88 +377,32 @@ arap_grid_add_pin (void *handle, float sx, float sy, float ddx, float ddy)
 
     v = r * (g->cols + 1) + c;
 
+    /* One hard pin per vertex: the first pin added to a vertex wins and
+       later pins on the same vertex are ignored. Callers pass pins in a
+       fixed order, so the result is deterministic. */
     for (i = 0; i < g->npin; i++)
         if (g->pv[i] == v)
-            break;
+            return;
 
-    if (i == g->npin)
     {
         int ncap = g->pcap ? g->pcap * 2 : 16;
 
-        if (!grow_pins (g, ncap))
+        if (g->npin == g->pcap && !grow_pins (g, ncap))
             return;
-
-        g->npin++;
     }
 
+    i = g->npin++;
     g->pv[i]  = v;
     g->ptx[i] = g->sx[v] + ddx;
     g->pty[i] = g->sy[v] + ddy;
 }
 
-void
-arap_grid_add_pin_sim (void *handle, float sx, float sy, float ddx, float ddy,
-                       float theta, float scale)
+/* Append a similarity/taper pin. Shared by add_pin_sim and add_pin_taper. */
+static void
+push_sim (ArapGrid *g, float sx, float sy, float ddx, float ddy,
+          float theta, float scale, float taper)
 {
-    ArapGrid *g = handle;
     float *q;
-    unsigned long h;
-
-    if (!g)
-        return;
-
-    if (theta == 0.0f && scale == 1.0f)
-    {
-        arap_grid_add_pin (handle, sx, sy, ddx, ddy);
-        return;
-    }
-
-    if (g->nsim == g->scap)
-    {
-        int ncap = g->scap ? g->scap * 2 : 16;
-
-        if (!grow_sim (g, ncap))
-            return;
-    }
-
-    q = g->sp + g->nsim * 6;
-    q[0] = sx;
-    q[1] = sy;
-    q[2] = ddx;
-    q[3] = ddy;
-    q[4] = theta;
-    q[5] = scale;
-    g->nsim++;
-
-    /* Only the similarity center affects the linear operator.
-       Target offset, rotation and scale only affect the right-hand side. */
-    h = (hash_float (sx) * 2654435761u) ^ hash_float (sy);
-    g->sim_sig = g->sim_sig * 131u + h;
-}
-
-void
-arap_grid_add_pin_taper (void *handle, float sx, float sy, float ddx, float ddy,
-                         float theta, float scale, float taper)
-{
-    ArapGrid *g = handle;
-    float *q;
-    unsigned long h;
-
-    if (!g)
-        return;
-
-    /* taper<=0 */
-    if (!(taper > 0.0f))
-    {
-        if (theta == 0.0f && scale == 1.0f)
-            arap_grid_add_pin (handle, sx, sy, ddx, ddy);
-        else
-            arap_grid_add_pin_sim (handle, sx, sy, ddx, ddy, theta, scale);
-        return;
-    }
-
-    /* taper>0: */
-    arap_grid_add_pin (handle, sx, sy, ddx, ddy);
 
     if (g->nsim == g->scap)
     {
@@ -478,9 +421,65 @@ arap_grid_add_pin_taper (void *handle, float sx, float sy, float ddx, float ddy,
     q[5] = scale;
     g->spt[g->nsim] = taper;
     g->nsim++;
+}
 
-    h = (hash_float (sx) * 2654435761u) ^ hash_float (sy) ^ hash_float (taper);
-    g->sim_sig = g->sim_sig * 131u + h;
+void
+arap_grid_add_pin_sim (void *handle, float sx, float sy, float ddx, float ddy,
+                       float theta, float scale)
+{
+    ArapGrid *g = handle;
+
+    if (!g)
+        return;
+
+    if (theta == 0.0f && scale == 1.0f)
+    {
+        arap_grid_add_pin (handle, sx, sy, ddx, ddy);
+        return;
+    }
+
+    push_sim (g, sx, sy, ddx, ddy, theta, scale, 0.0f);
+}
+
+void
+arap_grid_add_pin_taper (void *handle, float sx, float sy, float ddx, float ddy,
+                         float theta, float scale, float taper)
+{
+    ArapGrid *g = handle;
+
+    if (!g)
+        return;
+
+    /* taper<=0: plain pin or similarity pin, no taper region. */
+    if (!(taper > 0.0f))
+    {
+        arap_grid_add_pin_sim (handle, sx, sy, ddx, ddy, theta, scale);
+        return;
+    }
+
+    /* taper>0: a hard pin at the centre plus a tapered similarity region. */
+    arap_grid_add_pin (handle, sx, sy, ddx, ddy);
+    push_sim (g, sx, sy, ddx, ddy, theta, scale, taper);
+}
+
+/* Contiguous vertex index range [vlo, vhi] covering the grid rows that a
+   disc of radius R around sy can touch. Vertices are stored row-major, so
+   iterating this range in ascending order visits the same vertices in the
+   same order as a full scan, minus the ones that lie outside the disc. */
+static void
+sim_vrange (const ArapGrid *g, float sy, float R, float cellh,
+            int *vlo, int *vhi)
+{
+    int rlo = (int) floorf ((sy - R - g->sy[0]) / cellh) - 1;
+    int rhi = (int) floorf ((sy + R - g->sy[0]) / cellh) + 1;
+
+    if (rlo < 0) rlo = 0;
+    if (rlo > g->rows) rlo = g->rows;
+    if (rhi < 0) rhi = -1;
+    if (rhi > g->rows) rhi = g->rows;
+
+    *vlo = rlo * (g->cols + 1);
+    *vhi = rhi * (g->cols + 1) + g->cols;
 }
 
 static void
@@ -532,8 +531,11 @@ apply_sim (ArapGrid *g)
         float ct = cosf (th), st = sinf (th);
         float cx = sx + ddx, cy = sy + ddy;
         float wsum = 0.0f;
+        int vlo, vhi;
 
-        for (v = 0; v < g->nv; v++)
+        sim_vrange (g, sy, Rs, cellh, &vlo, &vhi);
+
+        for (v = vlo; v <= vhi; v++)
         {
             float ox, oy, d2, u, k;
 
@@ -555,7 +557,7 @@ apply_sim (ArapGrid *g)
         if (wsum <= 1e-6f)
             continue;
 
-        for (v = 0; v < g->nv; v++)
+        for (v = vlo; v <= vhi; v++)
         {
             float ox, oy, d2, u, k, w, allow, newW, tx, ty;
 
@@ -621,13 +623,26 @@ ensure_factor (ArapGrid *g)
     int i, j, t;
     int stride = g->band + 1;
 
-    sig = g->w_ver * 131u;
+    /* Fingerprint of everything that enters the matrix A. Pin targets and
+       rotation/scale only enter the right-hand side, so they are excluded:
+       including them would refactor on every drag step. The fingerprint is
+       a full FNV-1a over the inputs, not a sum, so distinct inputs do not
+       collide in practice and a stale factor cannot be reused silently. */
+    sig = 1469598103934665603UL;
+    sig = fnv_mix (sig, &g->w_ver, sizeof g->w_ver);
+    sig = fnv_mix (sig, &g->pin_edge, sizeof g->pin_edge);
+    sig = fnv_mix (sig, &g->acc_dirty, sizeof g->acc_dirty);
+    sig = fnv_mix (sig, &g->npin, sizeof g->npin);
+    if (g->npin > 0)
+        sig = fnv_mix (sig, g->pv, (size_t)g->npin * sizeof (int));
 
-    for (i = 0; i < g->npin; i++)
-        sig += (unsigned long)(g->pv[i] + 1) * 2654435761u;
-
-    sig += (unsigned long)g->pin_edge * 7919u;
-    sig += (unsigned long)g->nsim * 7919u + g->sim_sig;
+    sig = fnv_mix (sig, &g->nsim, sizeof g->nsim);
+    for (i = 0; i < g->nsim; i++)
+    {
+        /* centre only (sp[0..1]) and taper; offsets/angles are RHS-only */
+        sig = fnv_mix (sig, g->sp + i * 6, 2 * sizeof (float));
+        sig = fnv_mix (sig, g->spt + i, sizeof (float));
+    }
 
     if (g->fact_ok && sig == g->fact_sig)
         return 0;
@@ -886,14 +901,15 @@ fill_out (ArapGrid *g)
 }
 
 int
-arap_grid_solve (void *handle, int iters, int unused0, float tol, int warm)
+arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
 {
     ArapGrid *g = handle;
     double max_pin_disp = 0.0, limit;
     int it, i;
     int factor_new;
 
-    (void)unused0;
+    /* 'reserved' is kept so the exported ABI does not change. */
+    (void)reserved;
 
     if (!g)
         return 0;
@@ -1014,7 +1030,7 @@ arap_grid_solve (void *handle, int iters, int unused0, float tol, int warm)
 
     fill_out (g);
 
-    if (getenv ("PW_DEBUG"))
+    if (env_debug)
     {
         double md = 0.0;
 
@@ -1034,7 +1050,7 @@ arap_grid_solve (void *handle, int iters, int unused0, float tol, int warm)
                  (warm != 0), max_pin_disp, md, it);
     }
 
-    if (getenv ("PW_ARAP_PROF"))
+    if (env_prof)
     {
         fprintf (stderr,
                  "[arap-prof] factor_new=%d iters=%d npin=%d nsim=%d "

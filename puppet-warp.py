@@ -37,412 +37,35 @@ except ImportError:
     HAS_NUMPY = False
 
 
-PLUG_IN_PROC = "plug-in-puppet-warp"
-PLUG_IN_BINARY = "puppet_warp"
-GEGL_OP_NAME = "custom:puppet-warp"
-GEGL_OP_LABEL = "Puppet Warp"
+_PW_HERE = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.path.expanduser("~/.config/GIMP/3.2/plug-ins/puppet-warp")
+if _PW_HERE not in sys.path:
+    sys.path.insert(0, _PW_HERE)
 
-_IS_WIN = platform.system() == "Windows"
-_LIB_EXT = ".dll" if _IS_WIN else ".so"
-_LIB_NAME = "puppet-warp" + _LIB_EXT
-
-
-def _default_plugin_dir():
-    if _IS_WIN:
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "GIMP", "3.2", "plug-ins", "puppet-warp")
-    return os.path.expanduser("~/.config/GIMP/3.2/plug-ins/puppet-warp")
-
-
-PLUGIN_DIR = (
-    os.path.dirname(os.path.abspath(__file__))
-    if "__file__" in globals()
-    else _default_plugin_dir()
+from puppet_warp_native import (
+    _pw_lib_handle,
+    _pw_op_fresh,
+    GEGL_OP_NAME,
+    GEGL_USER_DIR,
+    MAX_PINS,
+    PLUGIN_DIR,
+    PLUG_IN_BINARY,
+    PLUG_IN_PROC,
+    _PW_DEBUG,
+    _as_list,
+    _dialog_lock_acquire,
+    _dialog_lock_release,
+    _hug_default_size,
+    _layer_index,
+    _load_arap_lib,
+    _unpack_offsets,
+    ensure_op,
+)
+from puppet_warp_resize import (
+    _resize_drawable_plan,
+    apply_filter_to_drawable,
+    remove_filter_from_drawable,
 )
 
-
-def _gegl_user_dir():
-    return os.path.join(GLib.get_user_data_dir(), "gegl-0.4", "plug-ins")
-
-
-GEGL_USER_DIR = _gegl_user_dir()
-
-MW_SO = os.path.join(PLUGIN_DIR, _LIB_NAME)
-MW_C = os.path.join(PLUGIN_DIR, "puppet-warp.c")
-AGRID_C = os.path.join(PLUGIN_DIR, "arap_grid.c")
-DIALOG_PID = os.path.join(GLib.get_tmp_dir(), "puppet-warp-dialog.pid")
-
-MAX_PINS = 256
-
-_op_ready = False
-_op_freshly_installed = False
-_LIB = None
-
-
-class ArapVec2(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
-
-
-def _load_arap_lib():
-    global _LIB
-
-    if _LIB is not None:
-        return _LIB
-
-    candidates = []
-    for prio, d in enumerate((PLUGIN_DIR, GEGL_USER_DIR)):
-        for name in (_LIB_NAME, "puppet-warp.so", "puppet-warp.dll"):
-            p = os.path.join(d, name)
-            if p in candidates:
-                continue
-            mtime = os.path.getmtime(p) if os.path.exists(p) else 0.0
-            candidates.append((prio, -mtime, p))
-    candidates.sort()
-    candidates = [p for _, _, p in candidates]
-
-    for path in candidates:
-        if not os.path.exists(path):
-            continue
-
-        try:
-            lib = ctypes.CDLL(path)
-
-            lib.arap_grid_new.argtypes = [ctypes.c_float] * 4 + [ctypes.c_int] * 2
-            lib.arap_grid_new.restype = ctypes.c_void_p
-
-            lib.arap_grid_add_pin.argtypes = [ctypes.c_void_p] + [ctypes.c_float] * 4
-            lib.arap_grid_add_pin.restype = None
-
-            lib.arap_grid_solve.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_float,
-                ctypes.c_int,
-            ]
-            lib.arap_grid_solve.restype = ctypes.c_int
-
-            lib.arap_grid_verts.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-            lib.arap_grid_verts.restype = ctypes.POINTER(ArapVec2)
-
-            lib.arap_grid_free.argtypes = [ctypes.c_void_p]
-            lib.arap_grid_free.restype = None
-
-            if hasattr(lib, "arap_grid_set_cell_weights"):
-                lib.arap_grid_set_cell_weights.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_int,
-                ]
-                lib.arap_grid_set_cell_weights.restype = None
-
-            if hasattr(lib, "arap_grid_set_pin_edge"):
-                lib.arap_grid_set_pin_edge.argtypes = [ctypes.c_void_p, ctypes.c_int]
-                lib.arap_grid_set_pin_edge.restype = None
-
-            if hasattr(lib, "arap_grid_add_pin_sim"):
-                lib.arap_grid_add_pin_sim.argtypes = [ctypes.c_void_p] + [ctypes.c_float] * 6
-                lib.arap_grid_add_pin_sim.restype = None
-
-            has_reset = hasattr(lib, "arap_grid_reset_pins")
-            if has_reset:
-                lib.arap_grid_reset_pins.argtypes = [ctypes.c_void_p]
-                lib.arap_grid_reset_pins.restype = None
-
-            has_preview = hasattr(lib, "pw_render_preview")
-            if has_preview:
-                lib.pw_render_preview.argtypes = [
-                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                    ctypes.c_int, ctypes.c_int,
-                    ctypes.POINTER(ctypes.c_float), ctypes.c_int,
-                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
-                ]
-                lib.pw_render_preview.restype = ctypes.c_int
-
-            view_argtypes = [
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int,
-                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
-                ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
-                ctypes.c_float, ctypes.c_float, ctypes.c_float,
-                ctypes.c_int,
-            ]
-
-            has_view = hasattr(lib, "pw_render_preview_view")
-            if has_view:
-                lib.pw_render_preview_view.argtypes = view_argtypes
-                lib.pw_render_preview_view.restype = ctypes.c_int
-
-            has_depth_view = hasattr(lib, "pw_render_preview_view_depth")
-            if has_depth_view:
-                lib.pw_render_preview_view_depth.argtypes = view_argtypes + [
-                    ctypes.c_int, ctypes.POINTER(ctypes.c_int)
-                ]
-                lib.pw_render_preview_view_depth.restype = ctypes.c_int
-
-            if hasattr(lib, "arap_grid_add_pin_taper"):
-                lib.arap_grid_add_pin_taper.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
-                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
-                ]
-                lib.arap_grid_add_pin_taper.restype = None
-
-            _LIB = lib
-
-            print(
-                f"[puppet-warp] loaded {path} "
-                f"(c-preview={'yes' if has_preview else 'no'} "
-                f"view={'yes' if has_view else 'no'} "
-                f"depth={'yes' if has_depth_view else 'no'} "
-                f"reset={'yes' if has_reset else 'no'})"
-            )
-
-            return lib
-
-        except Exception as e:
-            print(f"[puppet-warp] ctypes failed {path}: {e}")
-            continue
-
-    return None
-
-
-def _build_so():
-    srcs = (MW_C, AGRID_C)
-
-    if (
-        os.path.exists(MW_SO)
-        and all(os.path.exists(s) for s in srcs)
-        and os.path.getmtime(MW_SO) >= max(os.path.getmtime(s) for s in srcs)
-    ):
-        return True
-
-    if not all(os.path.exists(s) for s in srcs):
-        return False
-
-    try:
-        pc = subprocess.run(
-            ["pkg-config", "--cflags", "--libs", "gegl-0.4", "glib-2.0"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        if pc.returncode != 0:
-            return False
-
-        omp_ok = False
-        try:
-            pr = subprocess.run(
-                ["gcc", "-fopenmp", "-x", "c", "-c", "/dev/null", "-o", os.devnull],
-                capture_output=True,
-                timeout=30,
-            )
-            omp_ok = (pr.returncode == 0)
-        except Exception:
-            omp_ok = False
-
-        flags = [
-            "gcc",
-            "-O3",
-            "-ftree-vectorize",
-            "-shared",
-        ]
-
-        if not _IS_WIN:
-            flags.append("-fPIC")
-
-        if omp_ok:
-            flags.append("-fopenmp")
-
-        flags += [
-            MW_C,
-            AGRID_C,
-            "-o", MW_SO + ".tmp",
-            "-lm",
-        ]
-
-        cmd = flags + pc.stdout.split()
-
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            cwd=PLUGIN_DIR,
-        )
-
-        if r.returncode == 0 and os.path.exists(MW_SO + ".tmp"):
-            os.replace(MW_SO + ".tmp", MW_SO)
-            return True
-
-        if os.environ.get("PW_DEBUG"):
-            print("[puppet-warp] build failed:", r.stderr[-800:] if r.stderr else "")
-
-        return False
-
-    except Exception as e:
-        if os.environ.get("PW_DEBUG"):
-            print(f"[puppet-warp] build exception: {e}")
-        return False
-
-
-def _install_lib():
-    """Copy built/shipped binary into GEGL user plug-in dir."""
-    global _op_freshly_installed
-
-    dst = os.path.join(GEGL_USER_DIR, _LIB_NAME)
-
-    if not os.path.exists(MW_SO):
-        return
-
-    try:
-        if (
-            os.path.exists(dst)
-            and os.path.getsize(dst) == os.path.getsize(MW_SO)
-            and os.path.getmtime(dst) >= os.path.getmtime(MW_SO)
-        ):
-            return
-
-        os.makedirs(GEGL_USER_DIR, exist_ok=True)
-        fresh = not os.path.exists(dst)
-        shutil.copy2(MW_SO, dst)
-        _op_freshly_installed = fresh
-
-    except Exception as e:
-        print(
-            f"[puppet-warp] could not install {dst}: {e} "
-            "(close GIMP, reopen it and try again to update the operation)"
-        )
-
-
-def _load_op():
-    for d in (PLUGIN_DIR, GEGL_USER_DIR):
-        try:
-            if os.path.isdir(d) and hasattr(Gegl, "load_directory"):
-                Gegl.load_directory(d)
-        except Exception:
-            pass
-
-
-def _pid_alive(pid):
-    if pid <= 0:
-        return False
-
-    if _IS_WIN:
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        try:
-            k32 = ctypes.windll.kernel32
-            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if not h:
-                return False
-            code = ctypes.c_ulong(0)
-            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
-            k32.CloseHandle(h)
-            return bool(ok) and code.value == STILL_ACTIVE
-        except Exception:
-            return True
-
-    try:
-        return os.path.exists("/proc/%d" % pid)
-    except Exception:
-        return True
-
-
-def _dialog_lock_acquire():
-    """Single-instance guard. Returns path, "" if unusable, None if busy."""
-    try:
-        if os.path.exists(DIALOG_PID):
-            with open(DIALOG_PID) as fh:
-                old = int(fh.read().strip() or "0")
-            if old not in (0, os.getpid()) and _pid_alive(old):
-                return None
-
-        with open(DIALOG_PID, "w") as fh:
-            fh.write(str(os.getpid()))
-
-        return DIALOG_PID
-
-    except Exception:
-        return ""
-
-
-def _dialog_lock_release(path):
-    if not path:
-        return
-
-    try:
-        with open(path) as fh:
-            cur = int(fh.read().strip() or "0")
-        if cur == os.getpid():
-            os.unlink(path)
-    except Exception:
-        pass
-
-
-def ensure_op():
-    global _op_ready
-
-    if _op_ready:
-        return True
-
-    _build_so()
-    _install_lib()
-    _load_op()
-    _load_arap_lib()
-
-    _op_ready = True
-    return True
-
-
-def _hug_default_size(cw, ch):
-    asp = float(cw) / float(ch) if ch else 1.0
-    th = 560
-    tw = int(round(th * asp))
-
-    try:
-        disp = Gdk.Display.get_default()
-        mon = disp.get_primary_monitor() or disp.get_monitor(0)
-        geo = mon.get_geometry()
-        mw = int(geo.width * 0.85)
-        mh = int(geo.height * 0.80)
-    except Exception:
-        mw, mh = 1400, 1000
-
-    if tw > mw:
-        tw = mw
-        th = int(round(tw / asp)) if asp else th
-
-    if th > mh:
-        th = mh
-        tw = int(round(th * asp))
-
-    tw = max(240, tw)
-    th = max(200, th)
-
-    return tw + 12, th + 150
-
-
-def _unpack_offsets(t):
-    if isinstance(t, (list, tuple)) and len(t) >= 3 and isinstance(t[0], bool):
-        return int(t[1]), int(t[2])
-    if isinstance(t, (list, tuple)) and len(t) >= 2:
-        return int(t[0]), int(t[1])
-    raise ValueError(f"unexpected offsets tuple: {t!r}")
-
-
-def _layer_index(layers, target):
-    for i, l in enumerate(layers):
-        if l == target or l is target:
-            return i
-    raise ValueError("layer not found in get_layers()")
-
-
-def _as_list(x):
-    return x if isinstance(x, list) else list(x)
 
 
 class Pin:
@@ -477,27 +100,6 @@ def load_existing_params(drawable):
         pass
 
     return None
-
-
-def _pw_cw_floats(payload):
-    obj = payload[0] if isinstance(payload, tuple) and payload else payload
-
-    if isinstance(obj, (list, tuple)) and obj:
-        first = obj[0]
-        if (
-            not isinstance(first, (int, float, complex))
-            and hasattr(first, "__len__")
-        ):
-            obj = first
-
-    try:
-        return [float(getattr(v, "value", v)) for v in obj]
-    except Exception:
-        return []
-
-
-def _pw_cw_json(payload):
-    return [round(x, 4) for x in _pw_cw_floats(payload)]
 
 
 class PuppetWarpDialog(Gtk.Dialog):
@@ -660,15 +262,12 @@ class PuppetWarpDialog(Gtk.Dialog):
         self._tick_ms = 40.0
         self._render_ms = 0.0
         self._idle_iters = 30
+        self._warm_solve = False 
 
         self._verts_raw = None
         self._verts_raw_n = 0
         self._verts_raw_np = None
         self._verts_raw_seq = -1
-
-        self._verts_out = None
-        self._verts_out_n = 0
-        self._verts_out_np = None
 
         self._undo_stack = []
         self._redo_stack = []
@@ -807,6 +406,10 @@ class PuppetWarpDialog(Gtk.Dialog):
 
     def _on_dialog_key(self, w, e):
         kv = e.keyval
+
+        # Let text entries and spin buttons (a subclass of Entry) keep their keys.
+        if isinstance(self.get_focus(), Gtk.Entry):
+            return False
 
         if kv == Gdk.KEY_Escape:
             if e.state & (Gdk.ModifierType.MOD1_MASK
@@ -1216,8 +819,6 @@ class PuppetWarpDialog(Gtk.Dialog):
 
         # Show children once, then keep the row itself hidden by default.
         row3.show_all()
-        row3.set_no_show_all(True)
-        row3.hide()
 
         self.drawing_area = Gtk.DrawingArea()
         self.drawing_area.set_can_focus(True)
@@ -1284,10 +885,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         pins_flat = []
 
         for p in self.pins:
-            sx = round(p.sx * 2.0) / 2.0
-            sy = round(p.sy * 2.0) / 2.0
-            ddx = round((p.dx - p.sx) * 2.0) / 2.0
-            ddy = round((p.dy - p.sy) * 2.0) / 2.0
+            sx = round(p.sx, 3)
+            sy = round(p.sy, 3)
+            ddx = round(p.dx - p.sx, 3)
+            ddy = round(p.dy - p.sy, 3)
             pins_flat.extend([sx, sy, ddx, ddy])
 
         verts_flat = []
@@ -1319,21 +920,23 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             "pin_scale": [round(p.scale, 4) for p in self.pins],
             "pin_taper": [round(p.taper, 3) for p in self.pins],
             "pin_depth": [int(p.depth) for p in self.pins],
-            "region_x": 0,
-            "region_y": 0,
             "orig_width": int(self.canvas_w),
             "orig_height": int(self.canvas_h),
             "pins_flat": pins_flat,
-            "mask_w": int(self.cols),
-            "mask_h": int(self.rows),
-            "mask_flat": _pw_cw_json(self._cw_payload()),
+            "mask_flat": [round(x, 4) for x in self._cw_list()],
             "verts_flat": verts_flat,
         }
 
         return json.dumps(params, separators=(",", ":"), sort_keys=True)
 
+    def _cw_list(self):
+        if self.use_stiffness:
+            return self.cell_weights(self.cols, self.rows)
+        return [1.0] * (self.cols * self.rows)
+
     def _snap(self):
-        return [(p.sx, p.sy, p.dx, p.dy, p.theta, p.scale, p.taper, p.depth) for p in self.pins]
+        return [(p.sx, p.sy, p.dx, p.dy, p.theta, p.scale, p.taper, p.depth, p.qx, p.qy)
+                for p in self.pins]
 
     def _push_undo(self):
         self._undo_stack.append(self._snap())
@@ -1352,8 +955,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             p.scale = t[5] if len(t) > 5 else 1.0
             p.taper = t[6] if len(t) > 6 else 0.0
             p.depth = t[7] if len(t) > 7 else 0
-            p.qx = p.dx
-            p.qy = p.dy
+            p.qx = t[8] if len(t) > 9 else p.dx
+            p.qy = t[9] if len(t) > 9 else p.dy
             self.pins.append(p)
 
         self.active_pin_index = None
@@ -1366,7 +969,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.selected = set()
         self.multi_orig = None
         self.multi_anchor = None
-
+        
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self._update_pin_count()
@@ -1516,6 +1120,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             p.qx = p.sx
             p.qy = p.sy
 
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self._sync_pin_panel()
@@ -1539,13 +1144,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         i = self.active_pin_index
         valid = i is not None and 0 <= i < len(self.pins)
-
-        row = getattr(self, "pin_row", None)
-        if row is not None:
-            if valid:
-                row.show()
-            else:
-                row.hide()
 
         rot = getattr(self, "pin_rot_spin", None)
         scale = getattr(self, "pin_scale_spin", None)
@@ -1737,7 +1335,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self.active_pin_index = None
 
         self.selected = set()
-
+        
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self._update_pin_count()
@@ -1991,10 +1590,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         pins_flat = []
 
         for p in self.pins:
-            sx = round(p.sx * 2.0) / 2.0
-            sy = round(p.sy * 2.0) / 2.0
-            ddx = round((p.dx - p.sx) * 2.0) / 2.0
-            ddy = round((p.dy - p.sy) * 2.0) / 2.0
+            sx = round(p.sx, 3)
+            sy = round(p.sy, 3)
+            ddx = round(p.dx - p.sx, 3)
+            ddy = round(p.dy - p.sy, 3)
             pins_flat.extend([sx, sy, ddx, ddy])
 
         return json.dumps(
@@ -2320,6 +1919,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self._drag_pushed = False
 
         self._refresh_bg_preview()
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self._sync_pin_panel()
@@ -2333,6 +1933,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
     def _on_extend_toggled(self, b):
         self.extend_on = b.get_active()
         self._update_preview_pad()
+        self._raster_key = None
         da = getattr(self, "drawing_area", None)
         if da is not None:
             da.queue_draw()
@@ -2414,34 +2015,45 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.pins[i].depth = nd
         self.drawing_area.queue_draw()
 
+    def _bounds_of(self, verts):
+        """(minx, miny, maxx, maxy) over finite vertices; cached per solved list."""
+        if not verts:
+            return None
+
+        cache = getattr(self, "_bounds_cache", None)
+        if cache is not None and cache[0] is verts:
+            return cache[1]
+
+        res = None
+        try:
+            if HAS_NUMPY:
+                arr = np.asarray(verts, dtype=np.float64).reshape(-1, 2)
+                arr = arr[np.isfinite(arr).all(axis=1)]
+                if arr.size:
+                    res = (float(arr[:, 0].min()), float(arr[:, 1].min()),
+                           float(arr[:, 0].max()), float(arr[:, 1].max()))
+            else:
+                pts = [(float(x), float(y)) for x, y in verts]
+                pts = [(x, y) for x, y in pts if math.isfinite(x) and math.isfinite(y)]
+                if pts:
+                    xs = [q[0] for q in pts]
+                    ys = [q[1] for q in pts]
+                    res = (min(xs), min(ys), max(xs), max(ys))
+        except Exception:
+            res = None
+
+        self._bounds_cache = (verts, res)
+        return res
+
     def _pad_from_verts(self, verts):
         if not getattr(self, "extend_on", False) or not verts:
             return (0, 0, 0, 0)
 
-        minx = miny = float("inf")
-        maxx = maxy = float("-inf")
-
-        for vx, vy in verts:
-            try:
-                fx = float(vx)
-                fy = float(vy)
-            except Exception:
-                continue
-
-            if not math.isfinite(fx) or not math.isfinite(fy):
-                continue
-
-            if fx < minx:
-                minx = fx
-            if fy < miny:
-                miny = fy
-            if fx > maxx:
-                maxx = fx
-            if fy > maxy:
-                maxy = fy
-
-        if minx == float("inf"):
+        b = self._bounds_of(verts)
+        if b is None:
             return (0, 0, 0, 0)
+
+        minx, miny, maxx, maxy = b
 
         margin = 1.0
         cap = max(0, int(getattr(self, "max_extend", 8192)))
@@ -2708,6 +2320,34 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         return min(1.0, max(0.25, self._raster_zoom_now()))
 
+    def _raster_geometry(self):
+        """World rect + scale cho cached raster. Pan-invariant khi extend on."""
+        if not bool(getattr(self, "extend_on", False)):
+            return (0.0, 0.0, float(self.canvas_w), float(self.canvas_h),
+                    self._preview_scale())
+
+        b = self._bounds_of(getattr(self, "deformed_verts", None))
+        if b is None:
+            return (0.0, 0.0, float(self.canvas_w), float(self.canvas_h),
+                    self._preview_scale())
+
+        minx, miny, maxx, maxy = b
+        m = 2.0
+        cx0 = min(0.0, minx - m)
+        cy0 = min(0.0, miny - m)
+        cx1 = max(float(self.canvas_w), maxx + m)
+        cy1 = max(float(self.canvas_h), maxy + m)
+
+        area = max(1.0, (cx1 - cx0) * (cy1 - cy0))
+        scale = self._preview_scale()
+
+        # Cap raster ở ~4 M px để không cháy RAM/bandwidth trên ảnh lớn
+        MAX_PX = 4_000_000
+        if area * scale * scale > MAX_PX:
+            scale = max(0.1, (MAX_PX / area) ** 0.5)
+
+        return (cx0, cy0, cx1, cy1, scale)
+    
     def _view_rect(self):
         a = self.drawing_area.get_allocation()
         dw = a.width if a.width > 50 else 800
@@ -2723,27 +2363,14 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         # extend: allow the view to cover warped pixels outside bounds
         if bool(getattr(self, "extend_on", False)):
-            verts = getattr(self, "deformed_verts", None)
-            if verts:
-                minx = miny = float("inf")
-                maxx = maxy = float("-inf")
-                for vx, vy in verts:
-                    try:
-                        fx = float(vx); fy = float(vy)
-                    except Exception:
-                        continue
-                    if not math.isfinite(fx) or not math.isfinite(fy):
-                        continue
-                    if fx < minx: minx = fx
-                    if fy < miny: miny = fy
-                    if fx > maxx: maxx = fx
-                    if fy > maxy: maxy = fy
-                if minx != float("inf"):
-                    pad = 2.0
-                    vx0 = min(vx0, minx - pad)
-                    vy0 = min(vy0, miny - pad)
-                    vx1 = max(vx1, maxx + pad)
-                    vy1 = max(vy1, maxy + pad)
+            b = self._bounds_of(getattr(self, "deformed_verts", None))
+            if b is not None:
+                minx, miny, maxx, maxy = b
+                pad = 2.0
+                vx0 = min(vx0, minx - pad)
+                vy0 = min(vy0, miny - pad)
+                vx1 = max(vx1, maxx + pad)
+                vy1 = max(vy1, maxy + pad)
         else:
             vx0 = max(0.0, min(vx0, float(self.canvas_w - 1)))
             vy0 = max(0.0, min(vy0, float(self.canvas_h - 1)))
@@ -2751,6 +2378,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             vy1 = max(vy0 + 1.0, min(vy1, float(self.canvas_h)))
 
         s = max(0.25, min(1.0, z))
+
+        if (self.is_dragging_pin or self.is_rotating
+                or self.is_scaling or self.is_moving_pivot):
+            s *= 0.5
 
         return (vx0, vy0, vx1, vy1, s)
 
@@ -2775,18 +2406,21 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
     def _on_stiffness_toggled(self, b):
         self.use_stiffness = b.get_active()
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self.drawing_area.queue_draw()
 
     def _on_pin_edge_toggled(self, b):
         self.pin_edge = b.get_active()
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self.drawing_area.queue_draw()
 
     def _on_rotate_toggled(self, b):
         self.rotate_on = b.get_active()
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self.drawing_area.queue_draw()
@@ -2805,7 +2439,13 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         try:
             cw_arr, ncw, cw_sig = self._cw_payload()
-            grid_sig = (self.cols, self.rows)
+            # Rest-pose geometry is part of the signature: a cached grid built
+            # for a different puppet rectangle would silently keep old rest pins.
+            grid_sig = (
+                self.cols, self.rows,
+                float(self.puppet_x), float(self.puppet_y),
+                float(self.puppet_w), float(self.puppet_h),
+            )
 
             if can_reuse:
                 grid = self._grid
@@ -2906,7 +2546,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 ctypes.c_int(iters),
                 150,
                 ctypes.c_float(0.05),
-                ctypes.c_int(0),
+                ctypes.c_int(1 if self._warm_solve else 0),
             )
 
             n = ctypes.c_int(0)
@@ -2935,10 +2575,13 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 self._solve_seq += 1
                 self._verts_raw_seq = self._solve_seq
 
-                vv = [
-                    (self._verts_raw[2 * i], self._verts_raw[2 * i + 1])
-                    for i in range(n_val)
-                ]
+                if HAS_NUMPY:
+                    vv = self._verts_raw_np.tolist()
+                else:
+                    vv = [
+                        (self._verts_raw[2 * i], self._verts_raw[2 * i + 1])
+                        for i in range(n_val)
+                    ]
 
                 self.deformed_verts = vv
 
@@ -3008,6 +2651,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         t0 = time.monotonic()
 
         try:
+            self._warm_solve = True
             self._solve_preview(self._idle_iters)
 
             dt = (time.monotonic() - t0) * 1000.0
@@ -3022,7 +2666,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                     % (
                         dt,
                         self._render_ms,
-                        int(max(30, min(100, self._tick_ms * 1.25))),
+                        int(max(16, min(100, self._tick_ms * 1.25))),
                     )
                 )
 
@@ -3042,7 +2686,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             return
 
         if self._update_timer is None:
-            interval = int(max(30, min(100, self._tick_ms * 1.25)))
+            interval = int(max(16, min(100, self._tick_ms * 1.25)))
             self._update_timer = GLib.timeout_add(interval, self._deferred_update)
 
     def _screen_to_world(self, sx, sy):
@@ -3084,6 +2728,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             ns.add(i - 1 if i > h else i)
         self.selected = ns
 
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self._update_pin_count()
@@ -3526,7 +3171,15 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 self.drawing_area.queue_draw()
                 return True
 
-        s = 1.15 if e.direction == Gdk.ScrollDirection.UP else 1.0 / 1.15
+        if e.direction == Gdk.ScrollDirection.UP:
+            s = 1.15
+        elif e.direction == Gdk.ScrollDirection.DOWN:
+            s = 1.0 / 1.15
+        else:
+            ok, _dx, dy = e.get_scroll_deltas()
+            if not ok or dy == 0:
+                return True
+            s = 1.15 ** (-dy)
         nz = max(0.05, min(10.0, self.zoom * s))
 
         self.pan_x = e.x - (e.x - self.pan_x) * (nz / self.zoom)
@@ -3556,15 +3209,18 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.cols = nc
         self.rows = nr
 
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self.drawing_area.queue_draw()
 
     def _clear_pins(self):
+        self._push_undo()
         self.pins = []
         self.active_pin_index = None
         self.selected = set()
 
+        self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
         self._update_pin_count()
@@ -3734,6 +3390,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             mr, mg, mb = self.mesh_color
             cr.set_line_width(max(0.75, 1.0 / self.zoom))
 
+            # Group cells by colour: one stroke per colour instead of one per cell.
+            groups = {}
             for rr in range(self.rows):
                 for cc in range(self.cols):
                     i00 = rr * (self.cols + 1) + cc
@@ -3741,29 +3399,29 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                     i01 = i00 + (self.cols + 1)
                     i11 = i01 + 1
                     if ws is None:
-                        cr.set_source_rgba(mr, mg, mb, 0.25)
+                        rgba = (mr, mg, mb, 0.25)
                     else:
                         b = self._weight_bucket(ws[rr * self.cols + cc])
-
                         if b == 0:
-                            cr.set_source_rgba(1.0, 0.25, 0.20, 0.12)
+                            rgba = (1.0, 0.25, 0.20, 0.12)
                         else:
-                            cr.set_source_rgba(mr, mg, mb, 0.12 + 0.28 * ((b - 0.5) / 4.0))
+                            rgba = (mr, mg, mb, 0.12 + 0.28 * ((b - 0.5) / 4.0))
+                    groups.setdefault(rgba, []).append((i00, i10, i11, i01))
 
+            for rgba, quads in groups.items():
+                cr.set_source_rgba(*rgba)
+                cr.new_path()
+                for i00, i10, i11, i01 in quads:
                     if style in ("cells", "both"):
-                        cr.new_path()
                         cr.move_to(verts[i00][0], verts[i00][1])
                         cr.line_to(verts[i10][0], verts[i10][1])
                         cr.line_to(verts[i11][0], verts[i11][1])
                         cr.line_to(verts[i01][0], verts[i01][1])
                         cr.close_path()
-                        cr.stroke()
-
                     if style in ("triangles", "both"):
-                        cr.new_path()
                         cr.move_to(verts[i10][0], verts[i10][1])
                         cr.line_to(verts[i01][0], verts[i01][1])
-                        cr.stroke()
+                cr.stroke()
 
             cr.set_source_rgba(mr, mg, mb, 0.5)
             cr.set_line_width(max(1.0, 1.5 / self.zoom))
@@ -3942,7 +3600,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             cr.paint_with_alpha(0.55)
             return
 
-        lib = _LIB
+        lib = _pw_lib_handle()
         depth_on = self._depth_on()
         use_depth_preview = bool(
             depth_on and lib is not None and hasattr(lib, "pw_render_preview_view_depth")
@@ -3955,20 +3613,17 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             and os.environ.get("PW_NO_C_PREVIEW") != "1"
             and (not depth_on or use_depth_preview)
         ):
-            dragging = self.is_dragging_pin or self.is_rotating
+            dragging = (self.is_dragging_pin or self.is_rotating
+                        or self.is_scaling or self.is_moving_pivot)
 
-            if dragging or bool(getattr(self, "extend_on", False)):
+            if dragging:
                 vx0, vy0, vx1, vy1, scale_now = self._view_rect()
-                vkey = (
-                    round(vx0, 1),
-                    round(vy0, 1),
-                    round(vx1, 1),
-                    round(vy1, 1),
-                )
+                vkey = ("v",
+                        round(vx0, 1), round(vy0, 1),
+                        round(vx1, 1), round(vy1, 1))
             else:
-                vx0 = vy0 = 0.0
-                scale_now = self._preview_scale()
-                vkey = ()
+                vx0, vy0, vx1, vy1, scale_now = self._raster_geometry()
+                vkey = ("c",)
 
             dkey = tuple(int(p.depth) for p in self.pins) if depth_on else ()
             key = (
@@ -4076,7 +3731,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         except Exception:
             pass
 
-        if os.environ.get("PW_DEBUG"):
+        if _PW_DEBUG:
             print("[pw-py-tri]", self._tri_stat)
 
     def _warp_tri(self, cr, pattern, s0, s1, s2, d0, d1, d2):
@@ -4090,8 +3745,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         det = (u1 - u0) * (v2 - v0) - (v1 - v0) * (u2 - u0)
 
-        if not math.isfinite(det) or det < 0.5:
-            self._tri_stat["det"] += 1
+        if not math.isfinite(det):
             return
 
         dsq01 = (u1 - u0) ** 2 + (v1 - v0) ** 2
@@ -4225,20 +3879,17 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             dragging = bool(
                 getattr(self, "is_dragging_pin", False)
                 or getattr(self, "is_rotating", False)
+                or getattr(self, "is_scaling", False)
+                or getattr(self, "is_moving_pivot", False)
             )
 
-            # Extended preview needs the widened view rect even when idle.
-            use_view = dragging or bool(getattr(self, "extend_on", False))
-
-            if use_view:
+            if dragging:
                 vx0, vy0, vx1, vy1, scale = self._view_rect()
-                sw = max(1, int((vx1 - vx0) * scale))
-                sh = max(1, int((vy1 - vy0) * scale))
             else:
-                vx0 = vy0 = 0.0
-                scale = self._preview_scale()
-                sw = max(1, int(self.canvas_w * scale))
-                sh = max(1, int(self.canvas_h * scale))
+                vx0, vy0, vx1, vy1, scale = self._raster_geometry()
+
+            sw = max(1, int((vx1 - vx0) * scale))
+            sh = max(1, int((vy1 - vy0) * scale))
 
             if scale <= 0.0:
                 return False
@@ -4343,326 +3994,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         except Exception as e:
             print(f"[puppet-warp] c-preview failed, fallback python: {e}")
             return False
-
-def _pw_try(fn, *args):
-    try:
-        fn(*args)
-        return True
-    except Exception:
-        return False
-
-
-def _pw_has_resize_api(item):
-    if getattr(item, "resize", None):
-        return True
-
-    for cls_name in ("Item", "Layer", "Drawable"):
-        cls = getattr(Gimp, cls_name, None)
-        if cls is not None and getattr(cls, "resize", None):
-            return True
-
-    if getattr(Gimp, "item_resize", None):
-        return True
-
-    pdb = getattr(Gimp, "pdb", None)
-    if pdb is not None and getattr(pdb, "gimp_item_resize", None):
-        return True
-
-    return False
-
-
-def _pw_has_offset_api(item):
-    for name in ("set_offset", "set_offsets"):
-        if getattr(item, name, None):
-            return True
-
-    for cls_name in ("Item", "Layer", "Drawable"):
-        cls = getattr(Gimp, cls_name, None)
-        if cls is None:
-            continue
-
-        for name in ("set_offset", "set_offsets"):
-            if getattr(cls, name, None):
-                return True
-
-    for name in ("item_set_offset", "item_set_offsets"):
-        if getattr(Gimp, name, None):
-            return True
-
-    pdb = getattr(Gimp, "pdb", None)
-    if pdb is not None:
-        for name in ("gimp_item_set_offset", "gimp_item_set_offsets"):
-            if getattr(pdb, name, None):
-                return True
-
-    return False
-
-
-def _pw_resize_item(item, w, h, ax, ay):
-    # Bound method first: item.resize(...)
-    fn = getattr(item, "resize", None)
-    if fn and _pw_try(fn, w, h, ax, ay):
-        return True
-
-    # Unbound GIMP 3 class methods: Gimp.Item.resize(item, ...)
-    for cls_name in ("Item", "Layer", "Drawable"):
-        cls = getattr(Gimp, cls_name, None)
-        fn = getattr(cls, "resize", None) if cls is not None else None
-        if fn and _pw_try(fn, item, w, h, ax, ay):
-            return True
-
-    # Older namespace-style fallbacks, if present.
-    fn = getattr(Gimp, "item_resize", None)
-    if fn and _pw_try(fn, item, w, h, ax, ay):
-        return True
-
-    # GIMP 2 PDB compatibility, only if this build actually exposes it.
-    pdb = getattr(Gimp, "pdb", None)
-    fn = getattr(pdb, "gimp_item_resize", None) if pdb is not None else None
-    if fn and _pw_try(fn, item, w, h, ax, ay):
-        return True
-
-    return False
-
-
-def _pw_set_item_offset(item, x, y):
-    # Bound method first: item.set_offset(x, y)
-    for name in ("set_offset", "set_offsets"):
-        fn = getattr(item, name, None)
-        if fn and _pw_try(fn, x, y):
-            return True
-
-    # Unbound GIMP 3 class methods: Gimp.Item.set_offset(item, x, y)
-    for cls_name in ("Item", "Layer", "Drawable"):
-        cls = getattr(Gimp, cls_name, None)
-        if cls is None:
-            continue
-
-        for name in ("set_offset", "set_offsets"):
-            fn = getattr(cls, name, None)
-            if fn and _pw_try(fn, item, x, y):
-                return True
-
-    # Namespace-style fallbacks.
-    for name in ("item_set_offset", "item_set_offsets"):
-        fn = getattr(Gimp, name, None)
-        if fn and _pw_try(fn, item, x, y):
-            return True
-
-    # GIMP 2 PDB compatibility, guarded.
-    pdb = getattr(Gimp, "pdb", None)
-    if pdb is not None:
-        for name in ("gimp_item_set_offset", "gimp_item_set_offsets"):
-            fn = getattr(pdb, name, None)
-            if fn and _pw_try(fn, item, x, y):
-                return True
-
-    return False
-
-
-def _pw_image_undo(image):
-    # Roll back the measurement group if GIMP did not resize the mask.
-    if image is None:
-        return False
-    fn = getattr(image, "undo", None)
-    if fn and _pw_try(fn):
-        return True
-    cls = getattr(Gimp, "Image", None)
-    f = getattr(cls, "undo", None) if cls is not None else None
-    if f and _pw_try(f, image):
-        return True
-    f = getattr(Gimp, "image_undo", None)
-    if f and _pw_try(f, image):
-        return True
-    return False
-
-
-def _resize_drawable_plan(drawable, plan):
-    # mask-aware extend: measure GIMP's own mask resize, never hand-pad it.
-    if not plan or not plan.get("needs_resize"):
-        return True
-
-    try:
-        nw = int(plan["new_w"])
-        nh = int(plan["new_h"])
-        nox = int(plan["new_off_x"])
-        noy = int(plan["new_off_y"])
-        ax = int(plan.get("anchor_x", 0))
-        ay = int(plan.get("anchor_y", 0))
-    except Exception:
-        return False
-
-    if nw <= 0 or nh <= 0:
-        return False
-
-    if not _pw_has_resize_api(drawable):
-        print("[puppet-warp] resize aborted: no usable item resize API")
-        return False
-
-    if not _pw_has_offset_api(drawable):
-        print("[puppet-warp] resize aborted: no usable item offset API")
-        return False
-
-    if os.environ.get("PW_DEBUG"):
-        print(
-            "[pw-extend] resize w=%d h=%d anchor=(%d,%d) off=(%d,%d)"
-            % (nw, nh, ax, ay, nox, noy)
-        )
-
-    image = None
-    try:
-        image = drawable.get_image()
-    except Exception:
-        image = None
-
-    has_mask = False
-    try:
-        has_mask = drawable.get_mask() is not None
-    except Exception:
-        has_mask = False
-
-    if has_mask and os.environ.get("PW_NO_MASK_EXTEND") == "1":
-        if os.environ.get("PW_DEBUG"):
-            print("[pw-mask] PW_NO_MASK_EXTEND=1: padding layer, mask untouched")
-        has_mask = False
-
-    started = False
-    try:
-        if image is not None and hasattr(image, "undo_group_start"):
-            image.undo_group_start()
-            started = True
-    except Exception:
-        image = None
-
-    try:
-        if not _pw_resize_item(drawable, nw, nh, ax, ay):
-            raise RuntimeError("item resize failed")
-        if not _pw_set_item_offset(drawable, nox, noy):
-            raise RuntimeError("item offset failed")
-
-        if has_mask:
-            mw = mh = -1
-            mox = moy = 0
-            try:
-                m = drawable.get_mask()
-                if m is not None:
-                    mw = m.get_width()
-                    mh = m.get_height()
-                    mox, moy = _unpack_offsets(m.get_offsets())
-            except Exception:
-                pass
-
-            auto = (mw == nw and mh == nh)
-            if os.environ.get("PW_DEBUG"):
-                print(
-                    "[pw-mask] measure: layer %dx%d, mask now %dx%d off=(%d,%d) auto=%d"
-                    % (nw, nh, mw, mh, mox, moy, int(auto))
-                )
-
-            if not auto:
-                if _pw_image_undo(image):
-                    try:
-                        Gimp.displays_flush()
-                    except Exception:
-                        pass
-                    print(
-                        "[pw-mask] layer resize did NOT auto-pad mask; "
-                        "rolled back; extend skipped for this masked layer"
-                    )
-                else:
-                    print(
-                        "[pw-mask] did NOT auto-pad mask and undo unavailable; "
-                        "layer left padded with drifted mask -- press Ctrl+Z"
-                    )
-                return False
-
-        return True
-
-    except Exception as e:
-        print(f"[puppet-warp] resize plan failed: {e}")
-        return False
-
-    finally:
-        if started and image is not None:
-            try:
-                image.undo_group_end()
-            except Exception:
-                pass
-
-def apply_filter_to_drawable(drawable, params_json):
-    stale = []
-
-    try:
-        for f in list(drawable.get_filters() or []):
-            try:
-                f.get_config().get_property("params-json")
-                stale.append(f)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    for f in stale:
-        try:
-            f.delete()
-        except Exception:
-            try:
-                drawable.remove_filter(f)
-            except Exception:
-                pass
-
-    filt = Gimp.DrawableFilter.new(drawable, GEGL_OP_NAME, GEGL_OP_LABEL)
-    if filt is None:
-        return None
-
-    cfg = filt.get_config()
-    cfg.set_property("params-json", params_json)
-
-    if hasattr(drawable, "append_filter"):
-        drawable.append_filter(filt)
-    elif hasattr(drawable, "add_filter"):
-        drawable.add_filter(filt)
-
-    try:
-        drawable.update(0, 0, drawable.get_width(), drawable.get_height())
-    except Exception:
-        pass
-
-    try:
-        filt.set_visible(False)
-        filt.set_visible(True)
-    except Exception:
-        pass
-
-    try:
-        op = drawable.get_opacity()
-        drawable.set_opacity(max(0.0, op - 1.0))
-        drawable.set_opacity(op)
-    except Exception:
-        pass
-
-    try:
-        drawable.set_visible(False)
-        Gimp.displays_flush()
-        drawable.set_visible(True)
-    except Exception:
-        pass
-
-    return filt
-
-
-def remove_filter_from_drawable(drawable):
-    try:
-        for f in list(drawable.get_filters() or []):
-            try:
-                if f.get_operation_name() == GEGL_OP_NAME:
-                    f.delete()
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-
 class PuppetWarpPlugin(Gimp.PlugIn):
     def do_set_i18n(self, procname):
         return True, None, None
@@ -4775,7 +4106,7 @@ class PuppetWarpPlugin(Gimp.PlugIn):
 
             print(f"[puppet-warp] applied filter, pins={pin_count}")
 
-            if _op_freshly_installed:
+            if _pw_op_fresh():
                 Gimp.message(
                     "Puppet Warp: the GEGL operation was installed into "
                     f"{GEGL_USER_DIR}. Restart GIMP once so the filter can render."
@@ -4793,3 +4124,4 @@ class PuppetWarpPlugin(Gimp.PlugIn):
 
 if __name__ == "__main__":
     Gimp.main(PuppetWarpPlugin.__gtype__, sys.argv)
+
