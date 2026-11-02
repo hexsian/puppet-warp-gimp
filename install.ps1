@@ -65,12 +65,19 @@ function Install-Plugin {
     }
     New-Item -ItemType Directory -Force -Path $Target | Out-Null
 
+    # Do NOT copy native binaries (*.dll / *.so) into the plug-in folder.
+    # They are deployed only into the GEGL user plug-in directory below.
     Get-ChildItem -Path $SrcDir -Force |
-        Where-Object { ($Skip -notcontains $_.Name) -and ($_.Extension -ne '.zip') } |
+        Where-Object {
+            ($Skip -notcontains $_.Name) -and
+            ($_.Extension -ne '.zip')   -and
+            ($_.Extension -ne '.dll')   -and
+            ($_.Extension -ne '.so')
+        } |
         ForEach-Object { Copy-Item -Path $_.FullName -Destination $Target -Recurse -Force }
-    Log-Ok 'Copied plugin files.'
+    Log-Ok 'Copied plugin files (Python sources only; native binaries go to GEGL dir).'
 
-    $dll = Join-Path $Target $GeglModule
+    $dll = Join-Path $SrcDir $GeglModule
     if (Test-Path $dll) {
         foreach ($g in Get-GeglDirs) {
             New-Item -ItemType Directory -Force -Path $g | Out-Null

@@ -63,7 +63,8 @@ get_gegl_dirs() {
         "$HOME/snap/gimp/current/.local/share/gegl-0.4/plug-ins"
 }
 
-# Copy every file from this folder except the installers and VCS/cache junk.
+# Copy every file from this folder except the installers, VCS/cache junk,
+# and native binaries (*.so / *.dll) — those go to the GEGL dir only.
 copy_plugin_files() {
     local target_dir="$1"
     local item name
@@ -72,7 +73,7 @@ copy_plugin_files() {
         [[ -e "$item" ]] || continue
         name="$(basename "$item")"
         case "$name" in
-            install.sh|install.ps1|install.bat|.git|.github|.gitignore|__pycache__|*.zip) continue ;;
+            install.sh|install.ps1|install.bat|.git|.github|.gitignore|__pycache__|*.zip|*.so|*.dll) continue ;;
         esac
         cp -a "$item" "$target_dir/"
     done
@@ -89,7 +90,7 @@ install_plugin() {
     fi
     mkdir -p "$target_dir"
     copy_plugin_files "$target_dir"
-    log_success "Copied plugin files."
+    log_success "Copied plugin files (Python sources only; native binaries go to GEGL dir)."
 
     # +x only on GIMP 3 entry points; helper modules stay non-executable
     local found_entry=0 py_file fname
@@ -105,11 +106,11 @@ install_plugin() {
 
     [[ $found_entry -eq 0 ]] && log_warn "No recognized GIMP 3 entry point found in $target_dir."
 
-    if [[ -f "$target_dir/$GEGL_MODULE" ]]; then
+    if [[ -f "$SRC_DIR/$GEGL_MODULE" ]]; then
         local gegl_path
         while IFS= read -r gegl_path; do
             mkdir -p "$gegl_path"
-            cp -f "$target_dir/$GEGL_MODULE" "$gegl_path/"
+            cp -f "$SRC_DIR/$GEGL_MODULE" "$gegl_path/"
             log_success "Deployed $GEGL_MODULE -> $gegl_path"
         done < <(get_gegl_dirs)
     else
