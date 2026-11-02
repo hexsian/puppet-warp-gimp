@@ -1717,7 +1717,7 @@ puppet_warp_get_type (void)
   return pw_type;
 }
 
-const GeglModuleInfo *
+PW_EXPORT const GeglModuleInfo *
 gegl_module_query (GTypeModule *module)
 {
   static const GeglModuleInfo info = { GEGL_MODULE_ABI_VERSION };
@@ -1725,7 +1725,7 @@ gegl_module_query (GTypeModule *module)
   return &info;
 }
 
-gboolean
+PW_EXPORT gboolean
 gegl_module_register (GTypeModule *module)
 {
   pw_ensure_lock ();
@@ -1734,7 +1734,7 @@ gegl_module_register (GTypeModule *module)
   return puppet_warp_get_type () != 0;
 }
 
-gboolean
+PW_EXPORT gboolean
 gegl_module_unregister (GTypeModule *module)
 {
   (void) module;

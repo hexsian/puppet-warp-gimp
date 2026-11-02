@@ -44,9 +44,13 @@ function Get-PluginDirs {
     return $dirs
 }
 
-# GLib's user data dir on Windows is %APPDATA% (what the plug-in itself uses).
+# GEGL looks in GLib's user data dir, which on Windows is normally
+# %LOCALAPPDATA%; %APPDATA% is included as a fallback.
 function Get-GeglDirs {
-    return @(Join-Path $env:APPDATA 'gegl-0.4\plug-ins')
+    return @(
+        (Join-Path $env:LOCALAPPDATA 'gegl-0.4\plug-ins'),
+        (Join-Path $env:APPDATA 'gegl-0.4\plug-ins')
+    )
 }
 
 function Install-Plugin {
@@ -76,8 +80,10 @@ function Install-Plugin {
     }
     else {
         Log-Warn "No prebuilt $GeglModule included."
-        Log-Info 'The plug-in will try to compile it on first run (needs gcc + pkg-config'
-        Log-Info 'from MSYS2 MinGW-w64 with gegl/glib dev packages, available in PATH).'
+        Log-Warn 'Without it GIMP shows: the filter "custom:puppet-warp" is not installed.'
+        Log-Info "Put a Windows-built $GeglModule next to this installer and run it again,"
+        Log-Info 'or build it with MSYS2 (gcc + pkg-config + gegl/glib dev) and copy it to:'
+        foreach ($g in Get-GeglDirs) { Log-Info "  $g" }
     }
 }
 

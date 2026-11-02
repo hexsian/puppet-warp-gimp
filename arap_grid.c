@@ -5,6 +5,12 @@
 #include <math.h>
 #include <stdio.h>
 
+#if defined(_WIN32)
+# define PW_EXPORT __declspec(dllexport)
+#else
+# define PW_EXPORT __attribute__((visibility("default")))
+#endif
+
 typedef struct { float x, y; } ArapVec2;
 
 #define ARAP_PIN_W    1.0e3f
@@ -16,22 +22,22 @@ typedef struct { float x, y; } ArapVec2;
 #define ROT_MIN_PX    24.0f
 #define ARAP_TAPER_RANGE 3.0f
 
-void arap_grid_free (void *handle);
+PW_EXPORT void arap_grid_free (void *handle);
 
 /* Debug switches, read once in arap_grid_new (not per solve). */
 static int env_debug = 0;
 static int env_prof  = 0;
 
 /* FNV-1a over raw bytes; used to fingerprint the factor inputs. */
-static unsigned long
-fnv_mix (unsigned long h, const void *p, size_t n)
+static unsigned long long
+fnv_mix (unsigned long long h, const void *p, size_t n)
 {
     const unsigned char *b = p;
 
     while (n--)
     {
         h ^= *b++;
-        h *= 1099511628211UL;
+        h *= 1099511628211ULL;
     }
 
     return h;
@@ -42,7 +48,7 @@ typedef struct {
 
     float *sx, *sy, *dx, *dy;
     float *cw;
-    unsigned long w_ver;
+    unsigned long long w_ver;
 
     int *ea, *eb;
     float *ex, *ey;
@@ -62,7 +68,7 @@ typedef struct {
     float acc_max;
 
     double *A, *L;
-    unsigned long fact_sig;
+    unsigned long long fact_sig;
     int fact_ok;
 
     int nbnd;
@@ -152,7 +158,7 @@ grow_sim (ArapGrid *g, int ncap)
     return 1;
 }
 
-void *
+PW_EXPORT void *
 arap_grid_new (float x, float y, float w, float h, int cols, int rows)
 {
     ArapGrid *g;
@@ -298,7 +304,7 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
     return g;
 }
 
-void
+PW_EXPORT void
 arap_grid_set_cell_weights (void *handle, const float *w, int n)
 {
     ArapGrid *g = handle;
@@ -323,7 +329,7 @@ arap_grid_set_cell_weights (void *handle, const float *w, int n)
         g->w_ver++;
 }
 
-void
+PW_EXPORT void
 arap_grid_set_pin_edge (void *handle, int on)
 {
     ArapGrid *g = handle;
@@ -337,7 +343,7 @@ arap_grid_set_pin_edge (void *handle, int on)
         g->pin_edge = on;
 }
 
-void
+PW_EXPORT void
 arap_grid_reset_pins (void *handle)
 {
     ArapGrid *g = handle;
@@ -351,7 +357,7 @@ arap_grid_reset_pins (void *handle)
     g->acc_max = 0.0f;
 }
 
-void
+PW_EXPORT void
 arap_grid_add_pin (void *handle, float sx, float sy, float ddx, float ddy)
 {
     ArapGrid *g = handle;
@@ -423,7 +429,7 @@ push_sim (ArapGrid *g, float sx, float sy, float ddx, float ddy,
     g->nsim++;
 }
 
-void
+PW_EXPORT void
 arap_grid_add_pin_sim (void *handle, float sx, float sy, float ddx, float ddy,
                        float theta, float scale)
 {
@@ -441,7 +447,7 @@ arap_grid_add_pin_sim (void *handle, float sx, float sy, float ddx, float ddy,
     push_sim (g, sx, sy, ddx, ddy, theta, scale, 0.0f);
 }
 
-void
+PW_EXPORT void
 arap_grid_add_pin_taper (void *handle, float sx, float sy, float ddx, float ddy,
                          float theta, float scale, float taper)
 {
@@ -619,7 +625,7 @@ apply_sim (ArapGrid *g)
 static int
 ensure_factor (ArapGrid *g)
 {
-    unsigned long sig;
+    unsigned long long sig;
     int i, j, t;
     int stride = g->band + 1;
 
@@ -628,7 +634,7 @@ ensure_factor (ArapGrid *g)
        including them would refactor on every drag step. The fingerprint is
        a full FNV-1a over the inputs, not a sum, so distinct inputs do not
        collide in practice and a stale factor cannot be reused silently. */
-    sig = 1469598103934665603UL;
+    sig = 1469598103934665603ULL;
     sig = fnv_mix (sig, &g->w_ver, sizeof g->w_ver);
     sig = fnv_mix (sig, &g->pin_edge, sizeof g->pin_edge);
     sig = fnv_mix (sig, &g->acc_dirty, sizeof g->acc_dirty);
@@ -900,7 +906,7 @@ fill_out (ArapGrid *g)
     }
 }
 
-int
+PW_EXPORT int
 arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
 {
     ArapGrid *g = handle;
@@ -1054,7 +1060,7 @@ arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
     {
         fprintf (stderr,
                  "[arap-prof] factor_new=%d iters=%d npin=%d nsim=%d "
-                 "acc_dirty=%d w_ver=%lu pin_edge=%d\n",
+                 "acc_dirty=%d w_ver=%llu pin_edge=%d\n",
                  factor_new, it, g->npin, g->nsim,
                  g->acc_dirty, g->w_ver, g->pin_edge);
     }
@@ -1062,7 +1068,7 @@ arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
     return it;
 }
 
-ArapVec2 *
+PW_EXPORT ArapVec2 *
 arap_grid_verts (void *handle, int *n)
 {
     ArapGrid *g = handle;
@@ -1081,7 +1087,7 @@ arap_grid_verts (void *handle, int *n)
     return g->out;
 }
 
-void
+PW_EXPORT void
 arap_grid_free (void *handle)
 {
     ArapGrid *g = handle;
