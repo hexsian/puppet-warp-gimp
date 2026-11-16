@@ -107,7 +107,7 @@ gcc -O3 -ftree-vectorize -fno-math-errno -fno-trapping-math -shared -fPIC -fopen
 ```sh
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf \
     mingw-w64-ucrt-x86_64-gegl mingw-w64-ucrt-x86_64-cairo
-gcc -O3 -ftree-vectorize -fno-math-errno -fno-trapping-math -shared -fopenmp \
+gcc -O3 -ftree-vectorize -fno-math-errno -fno-trapping-math -shared -static-libgcc \
     puppet-warp.c arap_grid.c -o puppet-warp.dll -lm \
     $(pkg-config --cflags --libs gegl-0.4 glib-2.0)
 ```
