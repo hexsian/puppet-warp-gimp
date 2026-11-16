@@ -152,6 +152,10 @@ def _load_arap_lib():
                 lib.arap_grid_set_pin_edge.argtypes = [ctypes.c_void_p, ctypes.c_int]
                 lib.arap_grid_set_pin_edge.restype = None
 
+            if hasattr(lib, "arap_grid_set_mode"):
+                lib.arap_grid_set_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                lib.arap_grid_set_mode.restype = None
+
             if hasattr(lib, "arap_grid_add_pin_sim"):
                 lib.arap_grid_add_pin_sim.argtypes = [ctypes.c_void_p] + [ctypes.c_float] * 6
                 lib.arap_grid_add_pin_sim.restype = None

@@ -34,6 +34,12 @@ typedef struct { float x, y; } ArapVec2;
 #define ROT_MIN_PX    24.0f
 #define ARAP_TAPER_RANGE 3.0f
 
+#define ARAP_MODE_NORMAL  0
+#define ARAP_MODE_RIGID   1
+#define ARAP_MODE_DISTORT 2
+#define ARAP_MODE_ORGANIC 3
+#define ARAP_MODE_HYBRID  4
+
 PW_EXPORT void arap_grid_free (void *handle);
 
 /* Debug switches, read once in arap_grid_new (not per solve). */
@@ -103,6 +109,7 @@ typedef struct {
     float *sx, *sy, *dx, *dy;
     float *cw;
     unsigned long long w_ver;
+    int mode;
 
     int *ea, *eb;
     float *ex, *ey;
@@ -136,6 +143,7 @@ typedef struct {
     double *rx, *ry, *xx, *yy;
     double *xxb, *yyb;      /* zero-padded allocations behind xx / yy */
     double *tux, *tuy, *tvx, *tvy;  /* per-row cell terms used by build_rhs */
+    double *cs_buf, *ss_buf, *cs_tmp, *ss_tmp, *nrm_buf; /* per-cell buffers */
     double *F, *Bk, *invd;  /* solve-friendly copies of the Cholesky factor */
     int bwp;                /* band rounded up to a multiple of 8 */
     ArapVec2 *out;
@@ -234,6 +242,7 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
     g->nv = (cols + 1) * (rows + 1);
     g->nc = cols * rows;
     g->band = cols + 2;
+    g->mode = ARAP_MODE_NORMAL;
 
     g->sx = malloc ((size_t)g->nv * sizeof (float));
     g->sy = malloc ((size_t)g->nv * sizeof (float));
@@ -268,6 +277,15 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
         g->tvy = g->tvx + cols;
     }
 
+    g->cs_buf = calloc ((size_t)g->nc * 5, sizeof (double));
+    if (g->cs_buf)
+    {
+        g->ss_buf  = g->cs_buf + g->nc;
+        g->cs_tmp  = g->ss_buf + g->nc;
+        g->ss_tmp  = g->cs_tmp + g->nc;
+        g->nrm_buf = g->ss_tmp + g->nc;
+    }
+
     g->A = malloc ((size_t)g->nv * (g->band + 1) * sizeof (double));
     g->L = malloc ((size_t)g->nv * (g->band + 1) * sizeof (double));
 
@@ -288,7 +306,8 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
 
     if (!g->sx || !g->sy || !g->dx || !g->dy || !g->cw ||
         !g->ea || !g->eb || !g->ex || !g->ey || !g->out ||
-        !g->rx || !g->ry || !g->xx || !g->yy || !g->F || !g->Bk || !g->invd || !g->tux ||
+        !g->rx || !g->ry || !g->xx || !g->yy || !g->F || !g->Bk || !g->invd ||
+        !g->tux || !g->cs_buf ||
         !g->A || !g->L || !g->accW || !g->accTX || !g->accTY || !g->hard ||
         !g->bnd || !g->bndRX || !g->bndRY ||
         !g->regRX || !g->regRY || !g->accRX || !g->accRY)
@@ -414,6 +433,54 @@ arap_grid_set_pin_edge (void *handle, int on)
 
     if (g->pin_edge != on)
         g->pin_edge = on;
+}
+
+PW_EXPORT void
+arap_grid_set_mode (void *handle, int mode)
+{
+    ArapGrid *g = handle;
+
+    if (!g)
+        return;
+
+    if (mode < ARAP_MODE_NORMAL || mode > ARAP_MODE_HYBRID)
+        mode = ARAP_MODE_NORMAL;
+
+    g->mode = mode;
+}
+
+static void
+mode_params (int mode, double *cell_mul, double *diag_mul, double *reg_mul)
+{
+    switch (mode)
+    {
+    case ARAP_MODE_RIGID:
+        *cell_mul = 1.5;
+        *diag_mul = 2.5;
+        *reg_mul  = 0.5;
+        break;
+    case ARAP_MODE_DISTORT:
+        *cell_mul = 0.6;
+        *diag_mul = 0.2;
+        *reg_mul  = 0.2;
+        break;
+    case ARAP_MODE_ORGANIC:
+        *cell_mul = 1.0;
+        *diag_mul = 0.65;
+        *reg_mul  = 0.6;
+        break;
+    case ARAP_MODE_HYBRID:
+        *cell_mul = 1.1;
+        *diag_mul = 0.85;
+        *reg_mul  = 0.8;
+        break;
+    case ARAP_MODE_NORMAL:
+    default:
+        *cell_mul = 1.0;
+        *diag_mul = 1.0;
+        *reg_mul  = 1.0;
+        break;
+    }
 }
 
 PW_EXPORT void
@@ -725,6 +792,9 @@ ensure_factor (ArapGrid *g)
     unsigned long long sig;
     int i, j;
     int stride = g->band + 1;
+    double cell_mul, diag_mul, reg_mul;
+
+    mode_params (g->mode, &cell_mul, &diag_mul, &reg_mul);
 
     /* Fingerprint of everything that enters the matrix A. Pin targets and
        rotation/scale only enter the right-hand side, so they are excluded:
@@ -733,6 +803,7 @@ ensure_factor (ArapGrid *g)
        collide in practice and a stale factor cannot be reused silently. */
     sig = 1469598103934665603ULL;
     sig = fnv_mix (sig, &g->w_ver, sizeof g->w_ver);
+    sig = fnv_mix (sig, &g->mode, sizeof g->mode);
     sig = fnv_mix (sig, &g->pin_edge, sizeof g->pin_edge);
     sig = fnv_mix (sig, &g->acc_dirty, sizeof g->acc_dirty);
     sig = fnv_mix (sig, &g->npin, sizeof g->npin);
@@ -754,7 +825,7 @@ ensure_factor (ArapGrid *g)
 
     for (i = 0; i < g->nc; i++)
     {
-        double w = g->cw[i];
+        double w = (double)g->cw[i] * cell_mul;
         int e;
         int base = i * ARAP_EDGES;
 
@@ -763,14 +834,15 @@ ensure_factor (ArapGrid *g)
 
         for (e = 0; e < ARAP_EDGES; e++)
         {
+            double ew = (e >= 4) ? (w * diag_mul) : w;
             int a = g->ea[base + e];
             int b = g->eb[base + e];
             int hi = a > b ? a : b;
             int lo = a < b ? a : b;
 
-            g->A[(size_t)hi * stride + 0]         += w;
-            g->A[(size_t)lo * stride + 0]         += w;
-            g->A[(size_t)hi * stride + (hi - lo)] -= w;
+            g->A[(size_t)hi * stride + 0]         += ew;
+            g->A[(size_t)lo * stride + 0]         += ew;
+            g->A[(size_t)hi * stride + (hi - lo)] -= ew;
         }
     }
 
@@ -788,7 +860,7 @@ ensure_factor (ArapGrid *g)
 
     for (i = 0; i < g->nv; i++)
     {
-        double d = ARAP_REG;
+        double d = (double)ARAP_REG * reg_mul;
 
         if (g->acc_dirty && g->accW[i] > 0.0f)
             d += (double)g->accW[i];
@@ -1056,24 +1128,48 @@ band_solve2 (ArapGrid *g, double *rx, double *ry, double *x, double *y)
    terms of the Procrustes fit collapse to two corner differences:
        H = (p10 + p11) - (p00 + p01)      V = (p01 + p11) - (p00 + p10)
        cs = w*Hx + h*Vy                   ss = w*Hy - h*Vx
-   and, with R = (cr, sr) the best rotation, the edge contributions to the
-   right-hand side collapse to two vectors per cell:
-       u = 2 wc R (w, h)    -> v00 -= u,  v11 += u
-       v = 2 wc R (w, -h)   -> v10 += v,  v01 -= v
-   (the cell weight wc is 0 for transparent cells, which then add nothing).
-   This replaces 12 indexed edge visits per cell with straight-line row loops.
-   The rest grid is regular, so w and h are the same for every cell. */
+   and, with R = (cr, sr) the best rotation (weighted-smoothed and scaled per
+   deformation mode), the edge contributions to the right-hand side collapse to
+   two vectors per cell:
+       u = (1 + diag_mul) * cell_mul * wc * R (w, h)    -> v00 -= u,  v11 += u
+       v = (1 + diag_mul) * cell_mul * wc * R (w, -h)   -> v10 += v,  v01 -= v
+   (the cell weight wc is 0 for transparent cells, which then add nothing). */
 static void
 build_rhs (ArapGrid *g)
 {
     const int cols = g->cols, rows = g->rows, vs = cols + 1;
     const double cwd = (double)(g->sx[1] - g->sx[0]);
     const double chd = (double)(g->sy[vs] - g->sy[0]);
+    const double rest_den = 2.0 * (cwd * cwd + chd * chd);
     const float *dx = g->dx, *dy = g->dy;
-    double *rx = g->rx;
-    double *ry = g->ry;
+    double *rx = g->rx, *ry = g->ry;
     double *ux = g->tux, *uy = g->tuy, *vx = g->tvx, *vy = g->tvy;
-    int i, r, c;
+    double *cs_b = g->cs_buf, *ss_b = g->ss_buf;
+    double *cs_s = g->cs_tmp, *ss_s = g->ss_tmp;
+    double *nrm_b = g->nrm_buf;
+    const double *rot_c, *rot_s;
+    double cell_mul, diag_mul, reg_mul;
+    double rot_beta = 0.0;
+    int smooth_passes = 0;
+    int i, r, c, p;
+
+    mode_params (g->mode, &cell_mul, &diag_mul, &reg_mul);
+
+    if (g->mode == ARAP_MODE_RIGID)
+    {
+        smooth_passes = 2;
+        rot_beta = 0.35;
+    }
+    else if (g->mode == ARAP_MODE_ORGANIC)
+    {
+        smooth_passes = 2;
+        rot_beta = 0.28;
+    }
+    else if (g->mode == ARAP_MODE_HYBRID)
+    {
+        smooth_passes = 1;
+        rot_beta = 0.22;
+    }
 
     memset (rx, 0, (size_t)g->nv * sizeof (double));
     memset (ry, 0, (size_t)g->nv * sizeof (double));
@@ -1083,13 +1179,121 @@ build_rhs (ArapGrid *g)
         const float *x0 = dx + (size_t)r * vs, *x1 = x0 + vs;
         const float *y0 = dy + (size_t)r * vs, *y1 = y0 + vs;
         const float *wr = g->cw + (size_t)r * cols;
-        double *rx0 = rx + (size_t)r * vs, *rx1 = rx0 + vs;
-        double *ry0 = ry + (size_t)r * vs, *ry1 = ry0 + vs;
+        size_t rbase = (size_t)r * cols;
 
         for (c = 0; c < cols; c++)
         {
-            double w2 = 2.0 * (double)wr[c];
-            double hx, hy, vxd, vyd, cs, ss, nrm, cr, sr;
+            double hx, hy, vxd, vyd, cs, ss;
+
+            if (wr[c] <= 0.0f)
+            {
+                cs_b[rbase + c] = 0.0;
+                ss_b[rbase + c] = 0.0;
+                nrm_b[rbase + c] = 0.0;
+                continue;
+            }
+
+            hx  = ((double)x0[c + 1] + x1[c + 1]) - ((double)x0[c] + x1[c]);
+            hy  = ((double)y0[c + 1] + y1[c + 1]) - ((double)y0[c] + y1[c]);
+            vxd = ((double)x1[c] + x1[c + 1]) - ((double)x0[c] + x0[c + 1]);
+            vyd = ((double)y1[c] + y1[c + 1]) - ((double)y0[c] + y0[c + 1]);
+
+            cs = cwd * hx + chd * vyd;
+            ss = cwd * hy - chd * vxd;
+
+            cs_b[rbase + c] = cs;
+            ss_b[rbase + c] = ss;
+            nrm_b[rbase + c] = sqrt (cs * cs + ss * ss);
+        }
+    }
+
+    if (smooth_passes > 0)
+    {
+        for (p = 0; p < smooth_passes; p++)
+        {
+            const double *src_c = (p & 1) ? cs_s : cs_b;
+            const double *src_s = (p & 1) ? ss_s : ss_b;
+            double *dst_c = (p & 1) ? cs_b : cs_s;
+            double *dst_s = (p & 1) ? ss_b : ss_s;
+
+            for (r = 0; r < rows; r++)
+            {
+                for (c = 0; c < cols; c++)
+                {
+                    size_t idx = (size_t)r * cols + c;
+                    double nc = 0.0, ns = 0.0, wsum = 0.0;
+
+                    if (g->cw[idx] <= 0.0f)
+                    {
+                        dst_c[idx] = 0.0;
+                        dst_s[idx] = 0.0;
+                        continue;
+                    }
+
+                    if (r > 0 && g->cw[idx - cols] > 0.0f)
+                    {
+                        double w = (double)g->cw[idx - cols];
+                        nc += w * src_c[idx - cols];
+                        ns += w * src_s[idx - cols];
+                        wsum += w;
+                    }
+                    if (r + 1 < rows && g->cw[idx + cols] > 0.0f)
+                    {
+                        double w = (double)g->cw[idx + cols];
+                        nc += w * src_c[idx + cols];
+                        ns += w * src_s[idx + cols];
+                        wsum += w;
+                    }
+                    if (c > 0 && g->cw[idx - 1] > 0.0f)
+                    {
+                        double w = (double)g->cw[idx - 1];
+                        nc += w * src_c[idx - 1];
+                        ns += w * src_s[idx - 1];
+                        wsum += w;
+                    }
+                    if (c + 1 < cols && g->cw[idx + 1] > 0.0f)
+                    {
+                        double w = (double)g->cw[idx + 1];
+                        nc += w * src_c[idx + 1];
+                        ns += w * src_s[idx + 1];
+                        wsum += w;
+                    }
+
+                    if (wsum > 0.0)
+                    {
+                        double wn = rot_beta / wsum;
+                        dst_c[idx] = src_c[idx] + wn * nc;
+                        dst_s[idx] = src_s[idx] + wn * ns;
+                    }
+                    else
+                    {
+                        dst_c[idx] = src_c[idx];
+                        dst_s[idx] = src_s[idx];
+                    }
+                }
+            }
+        }
+
+        rot_c = (smooth_passes & 1) ? cs_s : cs_b;
+        rot_s = (smooth_passes & 1) ? ss_s : ss_b;
+    }
+    else
+    {
+        rot_c = cs_b;
+        rot_s = ss_b;
+    }
+
+    for (r = 0; r < rows; r++)
+    {
+        const float *wr = g->cw + (size_t)r * cols;
+        double *rx0 = rx + (size_t)r * vs, *rx1 = rx0 + vs;
+        double *ry0 = ry + (size_t)r * vs, *ry1 = ry0 + vs;
+        size_t rbase = (size_t)r * cols;
+
+        for (c = 0; c < cols; c++)
+        {
+            double w2 = (1.0 + diag_mul) * cell_mul * (double)wr[c];
+            double cs, ss, nrm0, nrm, cr, sr, s_asap, s_eff;
 
             if (w2 <= 0.0)
             {
@@ -1100,13 +1304,10 @@ build_rhs (ArapGrid *g)
                 continue;
             }
 
-            hx  = ((double)x0[c + 1] + x1[c + 1]) - ((double)x0[c] + x1[c]);
-            hy  = ((double)y0[c + 1] + y1[c + 1]) - ((double)y0[c] + y1[c]);
-            vxd = ((double)x1[c] + x1[c + 1]) - ((double)x0[c] + x0[c + 1]);
-            vyd = ((double)y1[c] + y1[c + 1]) - ((double)y0[c] + y0[c + 1]);
-            cs  = cwd * hx + chd * vyd;
-            ss  = cwd * hy - chd * vxd;
-            nrm = sqrt (cs * cs + ss * ss);
+            nrm0 = nrm_b[rbase + c];
+            cs   = rot_c[rbase + c];
+            ss   = rot_s[rbase + c];
+            nrm  = sqrt (cs * cs + ss * ss);
 
             if (nrm > 2e-9)
             {
@@ -1119,6 +1320,33 @@ build_rhs (ArapGrid *g)
                 cr = 1.0;
                 sr = 0.0;
             }
+
+            s_asap = (rest_den > 1e-9) ? (nrm0 / rest_den) : 1.0;
+            s_eff  = 1.0;
+
+            if (g->mode == ARAP_MODE_DISTORT)
+            {
+                s_eff = 1.0 + 0.85 * (s_asap - 1.0);
+                if (s_eff < 0.25) s_eff = 0.25;
+                else if (s_eff > 4.0) s_eff = 4.0;
+            }
+            else if (g->mode == ARAP_MODE_ORGANIC)
+            {
+                s_eff = 1.0 + 0.45 * tanh (s_asap - 1.0);
+                if (s_eff < 0.45) s_eff = 0.45;
+                else if (s_eff > 2.2) s_eff = 2.2;
+            }
+            else if (g->mode == ARAP_MODE_HYBRID)
+            {
+                double err = fabs (s_asap - 1.0);
+                double adapt = err / (err + 0.35);
+                s_eff = 1.0 + (0.20 + 0.65 * adapt) * (s_asap - 1.0);
+                if (s_eff < 0.30) s_eff = 0.30;
+                else if (s_eff > 3.33) s_eff = 3.33;
+            }
+
+            cr *= s_eff;
+            sr *= s_eff;
 
             ux[c] = w2 * (cr * cwd - sr * chd);
             uy[c] = w2 * (sr * cwd + cr * chd);
@@ -1153,19 +1381,16 @@ build_rhs (ArapGrid *g)
     {
         for (i = 0; i < g->nv; i++)
         {
-            rx[i] += g->accRX[i];
-            ry[i] += g->accRY[i];
-
-            rx[i] += g->regRX[i];
-            ry[i] += g->regRY[i];
+            rx[i] += g->accRX[i] + reg_mul * g->regRX[i];
+            ry[i] += g->accRY[i] + reg_mul * g->regRY[i];
         }
     }
     else
     {
         for (i = 0; i < g->nv; i++)
         {
-            rx[i] += g->regRX[i];
-            ry[i] += g->regRY[i];
+            rx[i] += reg_mul * g->regRX[i];
+            ry[i] += reg_mul * g->regRY[i];
         }
     }
 }
@@ -1250,7 +1475,7 @@ arap_solve_impl (void *handle, int iters, float tol, int warm, long long budget_
         }
     }
 
-    limit = 4.0 * max_pin_disp + 100.0;
+    limit = 20.0 * max_pin_disp + 1000.0;
 
     if (warm == 0)
     {
@@ -1338,18 +1563,18 @@ arap_solve_impl (void *handle, int iters, float tol, int warm, long long budget_
         }
 
         fprintf (stderr,
-                 "[arap] npin=%d nsim=%d max_accW=%.1f pin_edge=%d warm=%d "
+                 "[arap] mode=%d npin=%d nsim=%d max_accW=%.1f pin_edge=%d warm=%d "
                  "max_pin_disp=%.1f max_disp=%.1f iters=%d\n",
-                 g->npin, g->nsim, (double)g->acc_max, g->pin_edge,
+                 g->mode, g->npin, g->nsim, (double)g->acc_max, g->pin_edge,
                  (warm != 0), max_pin_disp, md, it);
     }
 
     if (env_prof)
     {
         fprintf (stderr,
-                 "[arap-prof] factor_new=%d iters=%d npin=%d nsim=%d "
+                 "[arap-prof] mode=%d factor_new=%d iters=%d npin=%d nsim=%d "
                  "acc_dirty=%d w_ver=%llu pin_edge=%d\n",
-                 factor_new, it, g->npin, g->nsim,
+                 g->mode, factor_new, it, g->npin, g->nsim,
                  g->acc_dirty, g->w_ver, g->pin_edge);
     }
 
@@ -1442,6 +1667,7 @@ arap_grid_free (void *handle)
     free (g->Bk);
     free (g->invd);
     free (g->tux);
+    free (g->cs_buf);
 
     free (g->out);
     free (g);

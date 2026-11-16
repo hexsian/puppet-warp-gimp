@@ -1,22 +1,28 @@
 # Puppet Warp (ARAP) for GIMP 3
 
-A non-destructive **puppet warp** filter for GIMP 3. Drop pins on a layer, drag them, and the image deforms *as rigidly as possible* (ARAP: as-rigid-as-possible deformation). Pins rotate, scale, taper, and carry a **depth** value so you can decide which part of the image overlaps in front when two regions cross. The warp lives as a regular GIMP layer filter, so you can close the dialog, keep editing, and reopen it later — nothing is baked in.
+A non-destructive **puppet warp** filter for GIMP 3. Drop pins on a layer, drag them, and the image deforms *as rigidly as possible* (ARAP: as-rigid-as-possible deformation) with selectable **deformation modes** including an **Adaptive Hybrid ARAP** solver. Pins rotate, scale, taper, and carry a **depth** value so you can decide which part of the image overlaps in front when two regions cross. The warp lives as a regular GIMP layer filter, so you can close the dialog, keep editing, and reopen it later — nothing is baked in.
 
 Equipped with an ultra-fast **C 1:1 Viewport Compositor**, hardware-accelerated **AVX2/FMA** routines, multi-level **Mipmap pyramids**, **Bicubic interpolation**, and alignment guides/snapping, the filter stays smooth and responsive (~60 FPS) even when working on large 4K/8K images with complex layer stacks.
 
 ## Features
 
-### Warping & Rigidity
+### Warping, Deformation Modes & Rigidity
+- **5 Deformation Modes** (`Mode` selector):
+  - **Normal — Balanced**: Standard ARAP deformation balancing rigidity and flexibility (default)
+  - **Rigid — Preserve**: Pure rigid local rotations with reinforced diagonal shear resistance and weighted multi-pass rotation smoothing across neighboring cells to keep straight structures intact
+  - **Distort — Flexible**: Allows strong local scaling with relaxed diagonal shear stiffness for elastic stretching, squashing, and free-form distortion
+  - **Organic**: Combines weighted rotation smoothing with nonlinear `tanh` scale saturation for natural, curved, tissue/cloth-like bends without mesh tearing
+  - **Hybrid ARAP**: Adaptive solver that blends rigid ARAP on low-stress regions with similarity (ASAP) on high-stretch regions, preventing triangle pinching and collapse under extreme pulls
 - Click to add pins, drag to deform; Shift snaps a drag to an axis
-- Rotate and scale around any pin (orange ring: drag the dot to rotate, drag the body to scale; or Alt+wheel / Ctrl+wheel)
+- Rotate and scale around any pin (orange ring: drag the dot to rotate, drag the body to scale; or Alt+wheel / Ctrl+wheel, including smooth trackpad scrolling)
 - Per-pin **taper** — how far a pin's influence reaches before it fades to the rest of the mesh (Shift+wheel, or the `T` field)
 - Per-pin **depth** — when two warped regions overlap, higher depth draws in front (`[` / `]`, or the `D` field). See [Pin depth](#pin-depth)
 - Custom pivot placement per pin (Ctrl+drag)
 - **Pin Edge** keeps the outer mesh border at its rest position
-- Adaptive stiffness mesh derived from the layer's alpha: transparent areas stay soft, while artwork silhouettes stay firm
+- Adaptive stiffness mesh derived from the layer's alpha (compact `uint8` footprint): transparent areas stay soft, while artwork silhouettes stay firm
 
 ### Canvas & Preview
-- **1:1 C Viewport Compositor**: Renders background, active warp, and foreground directly at screen viewport resolution using OpenMP + AVX2, bypassing heavy CPU scaling
+- **1:1 C Viewport Compositor**: Renders background, active warp, and foreground directly at screen viewport resolution using OpenMP + AVX2 with watertight edge rasterization (no semi-transparent diagonal seam artifacts)
 - **Mipmap Pyramid**: Automatically generates 1/2, 1/4, 1/8 downscaled textures for huge layers, eliminating zoom-out lag and pixel shimmering
 - **Preview Opacity**: Real-time 0–100% opacity slider to align artwork against underlying layers without affecting final export
 - **Layers Below & Layers Above**: Independently toggle and composite context layers:
@@ -33,13 +39,13 @@ Equipped with an ultra-fast **C 1:1 Viewport Compositor**, hardware-accelerated 
 - **Alignment Grid**: Configurable pixel-grid overlay (`Step px`) independent of the ARAP deformation mesh
 
 ### Workflow, Comparison & Multi-Layer Export
-- **Snapshots (`A`, `B`, `C`)**: Quick one-click state slots to save, restore, overwrite, or clear setup variations
+- **Snapshots (`A`, `B`, `C`)**: Quick one-click state slots to save, restore, overwrite, or clear setup variations (including deformation mode, grid, and options)
 - **`A⇄B⇄C` Compare & Cycle (`→` / `` ` ``)**: Non-destructively toggle or step sequentially through all saved variations (`Live → A → B → C → Live`) without losing unsaved work
 - **`Export A-C` to New Layers**: Optionally export all saved snapshots (`A`, `B`, `C`) as separate, non-destructive layers above the active layer when applying (`OK`), each with its own editable Puppet Warp filter and `Extend Image` bounds
 - **`Orig` Before/After (`\`)**: Instant visual comparison against the unwarped original layer
 - Full-state undo / redo inside the dialog (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y)
 - Multi-select pins (Shift+click, Ctrl+A), nudge with arrow keys (Shift = 10 px)
-- Save / load setups (pins, depth, taper, guides, options) as JSON **presets**
+- Save / load setups (pins, deformation mode, depth, taper, guides, options) as JSON **presets**
 - Non-destructive & Locale-safe: Full parameter persistence via GEGL filter config; unaffected by system comma/period decimal settings
 
 ## Requirements
@@ -60,6 +66,15 @@ The filter appears in two menus:
 
 Isolate the part you want to warp onto **its own layer** first — puppet warp deforms the entire layer, so a clean cutout gives the cleanest result.
 
+### Re-editing an existing Puppet Warp filter
+
+In GIMP 3, clicking a filter inside the layer **`fx`** popover opens GIMP's built-in generic GEGL dialog (which displays the internal `State (read-only)` JSON parameter because GIMP 3 does not allow GEGL filters to launch custom plug-in UIs from the `fx` list).
+
+To **re-edit** your pins, deformation mode, depth, or padding interactively:
+1. Select the layer that has the Puppet Warp `fx` applied.
+2. Run **Filters ▸ Deform ▸ Puppet Warp (ARAP)…** again (or assign a keyboard shortcut to `plug-in-puppet-warp` under *Edit ▸ Keyboard Shortcuts*).
+3. The plug-in automatically reloads your previous pins, mode, and settings, and updates the active filter when you click **OK**.
+
 ## Install
 
 ### Windows
@@ -78,7 +93,7 @@ Start GIMP, run the filter once, then restart GIMP so GEGL registers `custom:pup
 
 ## Build from source
 
-Sources: `puppet-warp.c` (GEGL op + viewport compositor + mipmap pyramid) and `arap_grid.c` (banded Cholesky ARAP solver).
+Sources: `puppet-warp.c` (GEGL op + viewport compositor + mipmap pyramid) and `arap_grid.c` (banded Cholesky ARAP / Hybrid solver).
 
 **Linux** (`gcc`, `pkg-config`, `gegl-0.4`, `glib-2.0`):
 ```sh
@@ -108,12 +123,13 @@ gcc -O3 -ftree-vectorize -fno-math-errno -fno-trapping-math -shared -fopenmp \
 | **Nudge pins** | Arrow keys (Shift = 10 px) |
 | **Delete pin** | Right-click, Alt+click, or Delete |
 | **Reset pin to rest** | Double-click the pin |
-| **Rotate** | Drag dot on orange ring, or Alt+wheel (Shift = 15° steps) |
-| **Scale** | Drag orange ring body, or Ctrl+wheel (Shift = 10% steps) |
+| **Rotate** | Drag dot on orange ring, or Alt+wheel / smooth scroll (Shift = 15° steps) |
+| **Scale** | Drag orange ring body, or Ctrl+wheel / smooth scroll (Shift = 10% steps) |
 | **Clear rotate / scale** | Double-click the orange ring |
 | **Move pin pivot** | Ctrl+drag on canvas |
-| **Taper (influence reach)** | Shift+wheel over pin, or `T` spinbox |
+| **Taper (influence reach)** | Shift+wheel / smooth scroll over pin, or `T` spinbox |
 | **Depth (overlap order)** | `[` = send back, `]` = bring front, or `D` spinbox |
+| **Deformation mode** | `Mode` dropdown (`Normal`, `Rigid`, `Distort`, `Organic`, `Hybrid ARAP`) |
 | **Cycle snapshots (`A → B → C → Live`)** | `` ` `` (backtick/grave), `→` button, or Right-click `A⇄B⇄C` |
 | **Before / After toggle** | `\` (backslash) or `Orig` button |
 | **Guides toggle** | Ctrl+; or `Guides` button |
@@ -146,9 +162,10 @@ When warped areas overlap, depth decides which region renders in front:
 
 ## Troubleshooting & Environment Variables
 
-- `PW_DEBUG=1`: Prints solver iteration counters, viewport compositor timings (`[pw-c-vp]`), and GEGL chunk processing metrics.
+- `PW_DEBUG=1`: Prints solver iteration counters, deformation mode, viewport compositor timings (`[pw-c-vp]`), and GEGL chunk processing metrics.
 - `PW_APPLY_BICUBIC=1`: Forces high-quality Catmull-Rom Bicubic filtering on final layer apply (default applies fast Bilinear).
 - `PW_NO_C_PREVIEW=1`: Forces fallback to the slower Python/Cairo preview renderer.
 - `PW_NO_BG=1`: Disables all background layer compositing.
 - `PW_PREVIEW_SCALE=0.5`: Clamps viewport preview scale (0.25–1.0) on ultra-high-resolution canvases.
 - `PW_NO_MASK_EXTEND=1`: Pads the layer bounds but ignores the layer mask on extend.
+- `PW_THREADS=4`: Caps OpenMP worker threads used by the C solver/renderer.

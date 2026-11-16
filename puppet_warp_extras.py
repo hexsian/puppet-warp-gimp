@@ -220,6 +220,11 @@ class PuppetWarpExtrasMixin:
             return True
 
         if vp_surf is None or vp_surf.get_width() != dw or vp_surf.get_height() != dh:
+            if vp_surf is not None:
+                try:
+                    vp_surf.finish()
+                except Exception:
+                    pass
             vp_surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, dw, dh)
             self._vp_surface = vp_surf
 
@@ -559,6 +564,12 @@ class PuppetWarpExtrasMixin:
 
     def _refresh_fg_preview(self):
         self._free_mip("_fg_mip")
+        old_fg = getattr(self, "_fg_surface", None)
+        if old_fg is not None:
+            try:
+                old_fg.finish()
+            except Exception:
+                pass
         self._fg_surface = None
         self._fg_off_x = 0.0
         self._fg_off_y = 0.0
@@ -634,6 +645,7 @@ class PuppetWarpExtrasMixin:
 
             surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, lw, lh)
             surf.get_data()[:] = araw
+            del araw
             surf.mark_dirty()
 
             self._fg_surface = surf
@@ -699,6 +711,7 @@ class PuppetWarpExtrasMixin:
             ctx = cairo.Context(surf)
             for l, x, y, lw, lh, op in reversed(items):
                 ls = None
+                raw = None
                 try:
                     raw = bytes(
                         l.get_buffer().get(
@@ -710,6 +723,8 @@ class PuppetWarpExtrasMixin:
                     )
                     ls = cairo.ImageSurface(cairo.FORMAT_ARGB32, lw, lh)
                     ls.get_data()[:] = raw
+                    del raw
+                    raw = None
                     ls.mark_dirty()
 
                     ctx.save()
@@ -720,6 +735,7 @@ class PuppetWarpExtrasMixin:
                 except Exception:
                     continue
                 finally:
+                    raw = None
                     if ls is not None:
                         try:
                             ls.finish()
@@ -757,6 +773,7 @@ class PuppetWarpExtrasMixin:
             "pin_edge": bool(self.pin_edge),
             "rotate_on": bool(self.rotate_on),
             "use_stiffness": bool(self.use_stiffness),
+            "deform_mode": str(getattr(self, "deform_mode", "normal")),
         }
 
     def _snapshot_apply_state(self, st, push_undo=True):
@@ -770,6 +787,12 @@ class PuppetWarpExtrasMixin:
         self.pin_edge = bool(st.get("pin_edge", self.pin_edge))
         self.rotate_on = bool(st.get("rotate_on", self.rotate_on))
         self.use_stiffness = bool(st.get("use_stiffness", self.use_stiffness))
+
+        dm = str(st.get("deform_mode", getattr(self, "deform_mode", "normal"))).strip().lower()
+        mode_keys = getattr(self, "_deform_keys", ("normal", "rigid", "distort", "organic", "hybrid"))
+        if dm not in mode_keys:
+            dm = "normal"
+        self.deform_mode = dm
 
         self._set_blocked(
             getattr(self, "cols_spin", None),
@@ -800,6 +823,12 @@ class PuppetWarpExtrasMixin:
             getattr(self, "_stiff_id", None),
             lambda v: self.stiff_check.set_active(v),
             self.use_stiffness,
+        )
+        self._set_blocked(
+            getattr(self, "deform_combo", None),
+            getattr(self, "_deform_id", None),
+            lambda v: self.deform_combo.set_active(v),
+            mode_keys.index(dm),
         )
 
         self._restore_snapshot(st["pins"])

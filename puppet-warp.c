@@ -35,6 +35,7 @@ extern void      arap_grid_free (void *g);
 
 extern void      arap_grid_set_cell_weights (void *g, const float *w, int n);
 extern void      arap_grid_set_pin_edge (void *g, int on);
+extern void      arap_grid_set_mode (void *g, int mode);
 extern void      arap_grid_add_pin_sim (void *g, float sx, float sy, float ddx, float ddy,
                                         float theta, float scale);
 extern void      arap_grid_add_pin_taper (void *g, float sx, float sy, float ddx, float ddy,
@@ -72,6 +73,33 @@ json_int (const char *json, const char *key, int dflt)
     return 0;
 
   return (int) g_ascii_strtoll (v, NULL, 10);
+}
+
+static int
+json_deform_mode (const char *json)
+{
+  const char *v = find_key (json, "deform_mode");
+
+  if (!v)
+    return 0;
+
+  while (*v == ' ' || *v == '\t')
+    v++;
+
+  if (*v == '"')
+    {
+      v++;
+      if (g_ascii_strncasecmp (v, "rigid", 5) == 0)   return 1;
+      if (g_ascii_strncasecmp (v, "distort", 7) == 0) return 2;
+      if (g_ascii_strncasecmp (v, "organic", 7) == 0) return 3;
+      if (g_ascii_strncasecmp (v, "hybrid", 6) == 0)  return 4;
+      return 0;
+    }
+
+  {
+    int m = (int) g_ascii_strtoll (v, NULL, 10);
+    return (m >= 0 && m <= 4) ? m : 0;
+  }
 }
 
 static int
@@ -115,7 +143,7 @@ static gchar *
 geom_key (const char *json)
 {
   static const char *const keys[] = {
-    "cols", "rows", "pin_edge", "rotate_on", "extend",
+    "cols", "rows", "pin_edge", "rotate_on", "extend", "deform_mode",
     "pad_left", "pad_top", "pad_right", "pad_bottom",
     "orig_width", "orig_height",
     "pins_flat", "mask_flat", "verts_flat",
@@ -217,7 +245,7 @@ typedef struct _PuppetWarpClass PuppetWarpClass;
 
 typedef struct
 {
-  int cols, rows, pin_edge, rotate_on, extend;
+  int cols, rows, pin_edge, rotate_on, extend, deform_mode;
   int pad_l, pad_t, pad_r, pad_b;
   int ow_i, oh_i;
 } PwScalars;
@@ -282,17 +310,18 @@ pw_params_refresh (PuppetWarp *self)
   self->gkey_len = self->gkey ? strlen (self->gkey) : 0;
   self->gkey_hash = self->gkey ? pw_fnv1a (self->gkey, self->gkey_len) : 0;
 
-  self->sc.cols      = json_int (json, "cols", 15);
-  self->sc.rows      = json_int (json, "rows", 15);
-  self->sc.pin_edge  = json_int (json, "pin_edge", 0);
-  self->sc.rotate_on = json_int (json, "rotate_on", 1);
-  self->sc.extend    = json_int (json, "extend", 0);
-  self->sc.pad_l     = json_int (json, "pad_left", 0);
-  self->sc.pad_t     = json_int (json, "pad_top", 0);
-  self->sc.pad_r     = json_int (json, "pad_right", 0);
-  self->sc.pad_b     = json_int (json, "pad_bottom", 0);
-  self->sc.ow_i      = json_int (json, "orig_width", 0);
-  self->sc.oh_i      = json_int (json, "orig_height", 0);
+  self->sc.cols        = json_int (json, "cols", 15);
+  self->sc.rows        = json_int (json, "rows", 15);
+  self->sc.pin_edge    = json_int (json, "pin_edge", 0);
+  self->sc.rotate_on   = json_int (json, "rotate_on", 1);
+  self->sc.extend      = json_int (json, "extend", 0);
+  self->sc.deform_mode = json_deform_mode (json);
+  self->sc.pad_l       = json_int (json, "pad_left", 0);
+  self->sc.pad_t       = json_int (json, "pad_top", 0);
+  self->sc.pad_r       = json_int (json, "pad_right", 0);
+  self->sc.pad_b       = json_int (json, "pad_bottom", 0);
+  self->sc.ow_i        = json_int (json, "orig_width", 0);
+  self->sc.oh_i        = json_int (json, "orig_height", 0);
 }
 
 static void
@@ -412,9 +441,21 @@ pw_cmp_tri_item (const void *a, const void *b)
 }
 
 static float *
-pw_fetch (GeglBuffer *input, const GeglRectangle *r)
+pw_try_fetch (GeglBuffer *input, const GeglRectangle *r)
 {
-  float *buf = g_new (float, (gsize) r->width * (gsize) r->height * 4);
+  gsize npix;
+  float *buf;
+
+  if (r->width <= 0 || r->height <= 0)
+    return NULL;
+
+  npix = (gsize) r->width * (gsize) r->height;
+  if (npix > G_MAXSIZE / (4 * sizeof (float)))
+    return NULL;
+
+  buf = g_try_new (float, npix * 4);
+  if (!buf)
+    return NULL;
 
   gegl_buffer_get (input, r, 1.0, babl_format ("RaGaBaA float"), buf,
                    GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
@@ -764,7 +805,7 @@ pw_span_avx2 (const PwSrc *src,
           __m256 wx = _mm256_insertf128_ps (
                         _mm256_castps128_ps256 (_mm_set1_ps (1.0f - tx)),
                         _mm_set1_ps (tx), 1);
-		  __m256 acc = _mm256_mul_ps (r0, _mm256_mul_ps (wx, _mm256_set1_ps (1.0f - ty)));
+          __m256 acc = _mm256_mul_ps (r0, _mm256_mul_ps (wx, _mm256_set1_ps (1.0f - ty)));
           __m128 s, va;
 
           acc = _mm256_fmadd_ps (r1, _mm256_mul_ps (wx, _mm256_set1_ps (ty)), acc);
@@ -1485,7 +1526,6 @@ warp_tri_fast_clip (const uint8_t *src, int sstride, int sw, int sh,
   double inv, a, b, c, d, e, f, sc, m_det;
   double minxu, maxxu, minyv, maxyv;
   double eff_vsc, min_det, needle_k;
-  const double eps = 1e-4;
   const double eu[3] = { u0, u1, u2 };
   const double ev[3] = { v0, v1, v2 };
   const double ex[3] = { x0, x1, x2 };
@@ -1582,8 +1622,14 @@ warp_tri_fast_clip (const uint8_t *src, int sstride, int sw, int sh,
           double xa = eu[edge];
           double xb = eu[next];
 
-          if (((ya <= fy && fy < yb) || (yb <= fy && fy < ya)) &&
-              fabs (yb - ya) > 1e-12)
+          /* Sort endpoints so shared edges compute bit-identical x intersections. */
+          if (ya > yb)
+            {
+              double t = ya; ya = yb; yb = t;
+              t = xa; xa = xb; xb = t;
+            }
+
+          if (ya <= fy && fy < yb && (yb - ya) > 1e-12)
             {
               if (nx < 3)
                 xs[nx++] = xa + (fy - ya) * (xb - xa) / (yb - ya);
@@ -1614,8 +1660,9 @@ warp_tri_fast_clip (const uint8_t *src, int sstride, int sw, int sh,
       if (low < -1e9) low = -1e9;
       if (high >  1e9) high =  1e9;
 
-      xstart = (int) ceil (low - 0.5 - eps);
-      xend   = (int) floor (high - 0.5 + eps);
+      /* Half-open [low, high) pixel-center rule: watertight, zero seam overlap. */
+      xstart = (int) ceil (low - 0.5);
+      xend   = (int) ceil (high - 0.5) - 1;
 
       if (xstart < minx) xstart = minx;
       if (xend > maxx) xend = maxx;
@@ -2187,6 +2234,18 @@ pw_render_viewport (void *dst_void, int dw, int dh, int dstride,
   if (opacity > 1.0f) opacity = 1.0f;
   op_a255 = (uint32_t) lroundf (opacity * 255.0f);
 
+  if (op_a255 >= 255u && pw_vp_wbuf_cap > 32u * 1024u * 1024u)
+    {
+      g_mutex_lock (&pw_vp_wbuf_lock);
+      if (pw_vp_wbuf_cap > 32u * 1024u * 1024u)
+        {
+          free (pw_vp_wbuf);
+          pw_vp_wbuf = NULL;
+          pw_vp_wbuf_cap = 0;
+        }
+      g_mutex_unlock (&pw_vp_wbuf_lock);
+    }
+
   /* Checkerboard world rect [0, sw) x [0, sh) in screen coords */
   cx0 = (int) floor (pan_x);
   cx1 = (int) ceil  ((double) sw * zoom + pan_x);
@@ -2545,6 +2604,7 @@ puppet_warp_process (GeglOperation       *operation,
   int pin_edge = self->sc.pin_edge;
   int rotate_on = self->sc.rotate_on;
   int extend = self->sc.extend;
+  int deform_mode = self->sc.deform_mode;
   int pad_l = self->sc.pad_l;
   int pad_t = self->sc.pad_t;
   int pad_r = self->sc.pad_r;
@@ -2684,6 +2744,8 @@ puppet_warp_process (GeglOperation       *operation,
 
                   if (pin_edge)
                     arap_grid_set_pin_edge (grid, 1);
+
+                  arap_grid_set_mode (grid, deform_mode);
 
                   for (ii = 0; ii < npins; ii++)
                     {
@@ -2888,17 +2950,22 @@ puppet_warp_process (GeglOperation       *operation,
                 ? (gsize) roi->width * (gsize) roi->height
                 : 0;
   float *shared_src = NULL;
-  if (ext_pix > 0 && ext_pix <= (gsize) 20000000 && roi_pix * 2 >= ext_pix)
-    shared_src = pw_fetch (input, &ext);
+  if (ext_pix > 0 && ext_pix <= (gsize) 32000000 && roi_pix * 2 >= ext_pix)
+    shared_src = pw_try_fetch (input, &ext);
 
   PwSpanFn span_fn = pw_get_span_fn ();
 
   {
     int nbands = (roi->height + PW_BAND_H - 1) / PW_BAND_H;
+    int nthreads = pw_omp_threads (nbands);
     int bi;
 
+    /* Avoid multi-thread RAM explosion when per-band buffers replace shared_src. */
+    if (shared_src == NULL && ext_pix > (gsize) 16000000 && nthreads > 4)
+      nthreads = 4;
+
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(pw_omp_threads (nbands))
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads)
 #endif
     for (bi = 0; bi < nbands; bi++)
       {
@@ -2916,7 +2983,9 @@ puppet_warp_process (GeglOperation       *operation,
         band.height = MIN (PW_BAND_H, roi->y + roi->height - band.y);
 
         npix = (gsize) band.width * (gsize) band.height;
-        tile = g_new0 (float, npix * 4);
+        tile = g_try_new0 (float, npix * 4);
+        if (!tile)
+          continue;
 
         if (shared_src != NULL)
           {
@@ -2926,7 +2995,7 @@ puppet_warp_process (GeglOperation       *operation,
         else if (pw_band_source (dxs, dys, cols, rows, ow, oh, pad_sx, pad_sy,
                                  &band, &ext, &need))
           {
-            band_src = pw_fetch (input, &need);
+            band_src = pw_try_fetch (input, &need);
             src.buf = band_src;
             src.rect = need;
           }
@@ -2939,64 +3008,67 @@ puppet_warp_process (GeglOperation       *operation,
           {
             if (don)
               {
-                int *zbuf = g_new (int, npix);
+                int *zbuf = g_try_new (int, npix);
                 gsize zi;
                 int ti;
 
-                for (zi = 0; zi < npix; zi++)
-                  zbuf[zi] = -1000000;
-
-                for (ti = 0; ti < nsorted_tris; ti++)
+                if (zbuf)
                   {
-                    const PwTriItem *it = &sorted_tris[ti];
-                    int i00, i10, i01, i11;
-                    float x0, y0, x1, y1, x2, y2, x3, y3;
+                    for (zi = 0; zi < npix; zi++)
+                      zbuf[zi] = -1000000;
 
-                    if (it->qmaxx < (double) band.x ||
-                        it->qminx > (double) (band.x + band.width) ||
-                        it->qmaxy < (double) band.y ||
-                        it->qminy > (double) (band.y + band.height))
-                      continue;
+                    for (ti = 0; ti < nsorted_tris; ti++)
+                      {
+                        const PwTriItem *it = &sorted_tris[ti];
+                        int i00, i10, i01, i11;
+                        float x0, y0, x1, y1, x2, y2, x3, y3;
 
-                    r = it->r;
-                    c = it->c;
-                    i00 = r * (cols + 1) + c;
-                    i10 = i00 + 1;
-                    i01 = i00 + (cols + 1);
-                    i11 = i01 + 1;
+                        if (it->qmaxx < (double) band.x ||
+                            it->qminx > (double) (band.x + band.width) ||
+                            it->qmaxy < (double) band.y ||
+                            it->qminy > (double) (band.y + band.height))
+                          continue;
 
-                    x0 = (float) c       * ow / cols + pad_sx;
-                    y0 = (float) r       * oh / rows + pad_sy;
-                    x1 = (float) (c + 1) * ow / cols + pad_sx;
-                    y1 = y0;
-                    x2 = x0;
-                    y2 = (float) (r + 1) * oh / rows + pad_sy;
-                    x3 = x1;
-                    y3 = y2;
+                        r = it->r;
+                        c = it->c;
+                        i00 = r * (cols + 1) + c;
+                        i10 = i00 + 1;
+                        i01 = i00 + (cols + 1);
+                        i11 = i01 + 1;
 
-                    if (it->which == 0)
-                      warp_tri (&src, tile, &band,
-                                dxs[i00], dys[i00],
-                                dxs[i10], dys[i10],
-                                dxs[i01], dys[i01],
-                                x0, y0,
-                                x1, y1,
-                                x2, y2,
-                                clamp_src, cx0, cy0, cx1, cy1,
-                                det_min, it->depth, zbuf, span_fn);
-                    else
-                      warp_tri (&src, tile, &band,
-                                dxs[i10], dys[i10],
-                                dxs[i11], dys[i11],
-                                dxs[i01], dys[i01],
-                                x1, y1,
-                                x3, y3,
-                                x2, y2,
-                                clamp_src, cx0, cy0, cx1, cy1,
-                                det_min, it->depth, zbuf, span_fn);
+                        x0 = (float) c       * ow / cols + pad_sx;
+                        y0 = (float) r       * oh / rows + pad_sy;
+                        x1 = (float) (c + 1) * ow / cols + pad_sx;
+                        y1 = y0;
+                        x2 = x0;
+                        y2 = (float) (r + 1) * oh / rows + pad_sy;
+                        x3 = x1;
+                        y3 = y2;
+
+                        if (it->which == 0)
+                          warp_tri (&src, tile, &band,
+                                    dxs[i00], dys[i00],
+                                    dxs[i10], dys[i10],
+                                    dxs[i01], dys[i01],
+                                    x0, y0,
+                                    x1, y1,
+                                    x2, y2,
+                                    clamp_src, cx0, cy0, cx1, cy1,
+                                    det_min, it->depth, zbuf, span_fn);
+                        else
+                          warp_tri (&src, tile, &band,
+                                    dxs[i10], dys[i10],
+                                    dxs[i11], dys[i11],
+                                    dxs[i01], dys[i01],
+                                    x1, y1,
+                                    x3, y3,
+                                    x2, y2,
+                                    clamp_src, cx0, cy0, cx1, cy1,
+                                    det_min, it->depth, zbuf, span_fn);
+                      }
+
+                    g_free (zbuf);
                   }
-
-                g_free (zbuf);
               }
             else
               {
@@ -3123,8 +3195,8 @@ puppet_warp_class_init (PuppetWarpClass *klass, gpointer class_data)
     oc,
     PROP_PARAMS_JSON,
     g_param_spec_string ("params-json",
-                         "params-json",
-                         "JSON encoded puppet warp parameters",
+                         "State (read-only)",
+                         "Internal Puppet Warp state. To edit interactively, reopen Filters -> Deform -> Puppet Warp (ARAP)...",
                          "{}",
                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
@@ -3189,6 +3261,22 @@ PW_EXPORT gboolean
 gegl_module_unregister (GTypeModule *module)
 {
   (void) module;
+
+  pw_ensure_lock ();
+  g_rw_lock_writer_lock (&pw_solve_lock);
+  g_free (pw_cache_json);
+  g_free (pw_cache_dx);
+  g_free (pw_cache_dy);
+  g_free (pw_cache_vdepth);
+  pw_cache_json = NULL;
+  pw_cache_dx = NULL;
+  pw_cache_dy = NULL;
+  pw_cache_vdepth = NULL;
+  pw_cache_nverts = 0;
+  pw_cache_level = -1;
+  pw_cache_depth_on = 0;
+  g_rw_lock_writer_unlock (&pw_solve_lock);
+
   g_mutex_lock (&pw_vp_wbuf_lock);
   free (pw_vp_wbuf);
   pw_vp_wbuf = NULL;

@@ -173,6 +173,16 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
         self.src_surface.get_data()[:] = raw
         self.src_surface.mark_dirty()
 
+        self._alpha = None
+        if HAS_NUMPY:
+            alpha_byte = 3 if sys.byteorder == "little" else 0
+            self._alpha = (
+                np.frombuffer(raw, dtype=np.uint8)
+                .reshape(ch, cw, 4)[:, :, alpha_byte]
+                .copy()
+            )
+        del raw
+
         self._bg_surface = None
         self._bg_off_x = 0
         self._bg_off_y = 0
@@ -181,6 +191,16 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
         self.bg_mode = "below"
         self._bg_keys = ("off", "below", "composite")
         self._mesh_keys = ("off", "cells", "triangles", "both")
+        self._deform_modes = (
+            ("normal",  "Normal — Balanced"),
+            ("rigid",   "Rigid — Preserve"),
+            ("distort", "Distort — Flexible"),
+            ("organic", "Organic — Hữu cơ"),
+            ("hybrid",  "Hybrid ARAP"),
+        )
+        self._deform_keys = tuple(k for k, _ in self._deform_modes)
+        self.deform_mode = "normal"
+
         self._bg_layers = None
         self._bg_pos = None
         self._bg_ox = 0
@@ -196,15 +216,6 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
             self._bg_ox, self._bg_oy = _unpack_offsets(drawable.get_offsets())
         except Exception as e:
             print(f"[puppet-warp] bg: layer lookup failed ({e})")
-
-        self._alpha = None
-        if HAS_NUMPY:
-            self._alpha = (
-                np.frombuffer(raw, dtype=np.uint8)
-                .reshape(ch, cw, 4)[:, :, 3]
-                .astype(np.float32)
-                / 255.0
-            )
 
         self._cw_list_cache = {}
         self._cw_payload_cache = {}
@@ -260,6 +271,7 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
         }
 
         self._checker = None
+        self._checker_surf = None
         self._checker_w = 0
         self._checker_h = 0
 
@@ -308,6 +320,10 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
                 self.pin_edge = bool(prev.get("pin_edge", False))
                 self.rotate_on = bool(prev.get("rotate_on", True))
                 self.use_stiffness = bool(prev.get("use_stiffness", True))
+
+                dm = str(prev.get("deform_mode", "normal")).strip().lower()
+                if dm in self._deform_keys:
+                    self.deform_mode = dm
 
                 bm = str(prev.get("bg_mode", "below")).strip().lower()
                 if bm == "full":
@@ -465,10 +481,37 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
             if hasattr(self, _m):
                 self._free_mip(_m)
 
-        self._vp_surface = None
-        self._dst_surface = None
-        self._dst_scaled = None
+        for _s in (
+            "_vp_surface",
+            "_dst_surface",
+            "_dst_scaled",
+            "_bg_surface",
+            "_fg_surface",
+            "src_surface",
+            "_checker_surf",
+        ):
+            surf = getattr(self, _s, None)
+            if surf is not None:
+                try:
+                    surf.finish()
+                except Exception:
+                    pass
+                setattr(self, _s, None)
+
+        self._checker = None
         self._mesh_path_cache = None
+        self._alpha = None
+        self._verts_raw = None
+        self._verts_raw_np = None
+        self.deformed_verts = None
+        self._last_good_verts = None
+        self._cw_list_cache.clear()
+        self._cw_payload_cache.clear()
+        self._cell_active_cache.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        if hasattr(self, "_snapshots") and isinstance(self._snapshots, dict):
+            self._snapshots.clear()
 
         prov = getattr(self, "_css_provider", None)
         if prov is not None:
@@ -522,7 +565,7 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
                     x1 = max(x0 + 1, int((c + 1) * wd / cols))
 
                     blk = self._alpha[y0:y1, x0:x1]
-                    m = float(blk.mean())
+                    m = float(blk.mean()) / 255.0
                     if m <= 0.02:
                         w[r * cols + c] = 0.0
                     else:
@@ -549,7 +592,7 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
                 for c in range(cols):
                     x0 = max(0, int(c * wd / cols) - 1)
                     x1 = min(wd, max(x0 + 1, int((c + 1) * wd / cols) + 1))
-                    if float(self._alpha[y0:y1, x0:x1].max()) > 0.0:
+                    if int(self._alpha[y0:y1, x0:x1].max()) > 0:
                         flags[r * cols + c] = 1
             arr = (ctypes.c_uint8 * n)(*flags)
         else:
@@ -687,6 +730,25 @@ class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
         reset.set_tooltip_text("Reset deformation but keep pins.")
         reset.connect("clicked", lambda b: self._reset_warp())
         row1.pack_start(reset, False, False, 0)
+
+        row1.pack_start(sep(), False, False, 0)
+
+        row1.pack_start(Gtk.Label(label="Mode"), False, False, 0)
+
+        self.deform_combo = Gtk.ComboBoxText()
+        for _k, _lab in self._deform_modes:
+            self.deform_combo.append_text(_lab)
+        self.deform_combo.set_active(self._deform_keys.index(self.deform_mode))
+        self.deform_combo.set_tooltip_text(
+            "Deformation mode:\n"
+            "• Normal — Balanced ARAP\n"
+            "• Rigid — Preserve Structure (smoothed rigid rotations)\n"
+            "• Distort — Flexible Deformation (high stretch/shear)\n"
+            "• Organic — Biến dạng hữu cơ (smooth curvature + soft volume)\n"
+            "• Hybrid ARAP — Adaptive ARAP/ASAP blend"
+        )
+        self._deform_id = self.deform_combo.connect("changed", self._on_deform_mode_changed)
+        row1.pack_start(self.deform_combo, False, False, 0)
 
         row1.pack_start(sep(), False, False, 0)
 
@@ -925,6 +987,26 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
 
         self.show_all()
 
+    def _deform_mode_id(self):
+        try:
+            return self._deform_keys.index(getattr(self, "deform_mode", "normal"))
+        except ValueError:
+            return 0
+
+    def _on_deform_mode_changed(self, combo):
+        idx = combo.get_active()
+        if 0 <= idx < len(self._deform_keys):
+            nm = self._deform_keys[idx]
+            if nm == self.deform_mode:
+                return
+            self._exit_compare_modes(keep_shown=True)
+            self._push_undo()
+            self.deform_mode = nm
+            self._warm_solve = False
+            self._solve_preview()
+            self._last_solve_sig = self._solve_sig()
+            self.drawing_area.queue_draw()
+
     def _cw_payload(self):
         sig = (self.cols, self.rows, bool(self.use_stiffness))
 
@@ -981,6 +1063,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
             "pin_edge": bool(self.pin_edge),
             "rotate_on": bool(self.rotate_on),
             "use_stiffness": bool(self.use_stiffness),
+            "deform_mode": str(getattr(self, "deform_mode", "normal")),
             "extend": bool(getattr(self, "extend_on", False)),
             "pad_left": int(getattr(self, "pad_left", 0)),
             "pad_top": int(getattr(self, "pad_top", 0)),
@@ -1100,7 +1183,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
         if kv == Gdk.KEY_grave and not ctrl and not alt:
             if hasattr(self, "_on_compare_cycle"):
                 return self._on_compare_cycle()
-        
+
         if kv == Gdk.KEY_semicolon and ctrl:
             if hasattr(self, "guides_btn"):
                 self.guides_btn.set_active(not self.guides_btn.get_active())
@@ -1479,14 +1562,19 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
             return 1
 
     def _refresh_bg_preview(self):
+        if hasattr(self, "_free_mip"):
+            self._free_mip("_bg_mip")
+        old_bg = getattr(self, "_bg_surface", None)
+        if old_bg is not None:
+            try:
+                old_bg.finish()
+            except Exception:
+                pass
         self._bg_surface = None
         self._bg_off_x = 0
         self._bg_off_y = 0
         self._bg_alpha = 1.0
         self._bg_bounds = None
-
-        if hasattr(self, "_free_mip"):
-            self._free_mip("_bg_mip")
         self._bg_ver = getattr(self, "_bg_ver", 0) + 1
 
         keys = getattr(self, "_bg_keys", ("off", "below", "composite"))
@@ -1555,6 +1643,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
 
             bs = cairo.ImageSurface(cairo.FORMAT_ARGB32, lw, lh)
             bs.get_data()[:] = braw
+            del braw
             bs.mark_dirty()
 
             self._bg_surface = bs
@@ -1626,6 +1715,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
 
             for l, x, y, lw, lh, op in reversed(items):
                 ls = None
+                raw = None
                 try:
                     raw = bytes(
                         l.get_buffer().get(
@@ -1638,6 +1728,8 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
 
                     ls = cairo.ImageSurface(cairo.FORMAT_ARGB32, lw, lh)
                     ls.get_data()[:] = raw
+                    del raw
+                    raw = None
                     ls.mark_dirty()
 
                     ctx.save()
@@ -1649,6 +1741,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                 except Exception:
                     continue
                 finally:
+                    raw = None
                     if ls is not None:
                         try:
                             ls.finish()
@@ -1735,6 +1828,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                 "rotate_on": bool(self.rotate_on),
                 "extend": bool(self.extend_on),
                 "use_stiffness": bool(self.use_stiffness),
+                "deform_mode": str(getattr(self, "deform_mode", "normal")),
                 "bg_mode": str(self.bg_mode),
                 "fg_mode": str(getattr(self, "fg_mode", "off")),
                 "fg_on": bool(getattr(self, "fg_mode", "off") != "off"),
@@ -1904,6 +1998,17 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
             getattr(self, "_stiff_id", None),
             lambda v: self.stiff_check.set_active(v),
             self.use_stiffness,
+        )
+
+        dm = str(pkg.get("deform_mode", self.deform_mode)).strip().lower()
+        if dm not in self._deform_keys:
+            dm = "normal"
+        self.deform_mode = dm
+        self._set_blocked(
+            getattr(self, "deform_combo", None),
+            getattr(self, "_deform_id", None),
+            lambda v: self.deform_combo.set_active(v),
+            self._deform_keys.index(dm),
         )
 
         self.pin_edge = bool(pkg.get("pin_edge", self.pin_edge))
@@ -2382,7 +2487,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
             self.get_resize_plan(),
             len(self.pins),
         )
-    
+
     def _heal_reopen_pad(self, prev=None):
         draw_w = self.drawable.get_width()
         draw_h = self.drawable.get_height()
@@ -2441,6 +2546,12 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                 rect, 1.0, "cairo-ARGB32", Gegl.AbyssPolicy.NONE,
             )
         )
+        old_src = getattr(self, "src_surface", None)
+        if old_src is not None:
+            try:
+                old_src.finish()
+            except Exception:
+                pass
         self.src_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, ow, oh)
         self.src_surface.get_data()[:] = raw
         self.src_surface.mark_dirty()
@@ -2448,13 +2559,15 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
         self._alpha = None
         if HAS_NUMPY:
             try:
+                alpha_byte = 3 if sys.byteorder == "little" else 0
                 self._alpha = (
                     np.frombuffer(raw, dtype=np.uint8)
-                    .reshape(oh, ow, 4)[:, :, 3]
-                    .astype(np.float32) / 255.0
+                    .reshape(oh, ow, 4)[:, :, alpha_byte]
+                    .copy()
                 )
             except Exception:
                 self._alpha = None
+        del raw
 
         self._cw_list_cache = {}
         self._cw_payload_cache = {}
@@ -2705,6 +2818,9 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
             if hasattr(lib, "arap_grid_set_pin_edge"):
                 lib.arap_grid_set_pin_edge(grid, 1 if self.pin_edge else 0)
 
+            if hasattr(lib, "arap_grid_set_mode"):
+                lib.arap_grid_set_mode(grid, self._deform_mode_id())
+
             if can_reuse:
                 lib.arap_grid_reset_pins(grid)
 
@@ -2831,6 +2947,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
         return (
             self.cols,
             self.rows,
+            str(getattr(self, "deform_mode", "normal")),
             bool(self.pin_edge),
             bool(self.rotate_on),
             bool(self.use_stiffness),
@@ -3398,26 +3515,35 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
 
         return False
 
+    def _scroll_delta(self, e):
+        if e.direction == Gdk.ScrollDirection.UP:
+            return 1.0
+        if e.direction == Gdk.ScrollDirection.DOWN:
+            return -1.0
+        if e.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = e.get_scroll_deltas()
+            if ok and dy != 0.0:
+                return -float(dy)
+        return 0.0
+
     def _on_scroll(self, w, e):
         st = e.state
         ctrl = bool(st & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(st & Gdk.ModifierType.MOD1_MASK)
         shift = bool(st & Gdk.ModifierType.SHIFT_MASK)
 
+        delta = self._scroll_delta(e)
+        if delta == 0.0:
+            return True
+
         if shift and not ctrl and not alt:
             h = self._find_pin_at(e.x, e.y)
             if h is None:
                 h = self.active_pin_index
             if h is not None and 0 <= h < len(self.pins):
-                if e.direction == Gdk.ScrollDirection.UP:
-                    tstep = 0.05
-                elif e.direction == Gdk.ScrollDirection.DOWN:
-                    tstep = -0.05
-                else:
-                    return True
                 self._begin_edit_burst()
                 p = self.pins[h]
-                p.taper = max(0.0, min(1.0, p.taper + tstep))
+                p.taper = max(0.0, min(1.0, p.taper + 0.05 * delta))
                 self.active_pin_index = h
                 self.selected = {h}
                 self._panel_sync_t = time.monotonic()
@@ -3432,13 +3558,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                 h = self.active_pin_index
 
             if h is not None and 0 <= h < len(self.pins):
-                if e.direction == Gdk.ScrollDirection.UP:
-                    step = 0.10 if (e.state & Gdk.ModifierType.SHIFT_MASK) else 0.02
-                elif e.direction == Gdk.ScrollDirection.DOWN:
-                    step = -(0.10 if (e.state & Gdk.ModifierType.SHIFT_MASK) else 0.02)
-                else:
-                    return True
-
+                step = (0.10 if shift else 0.02) * delta
                 self._begin_edit_burst()
                 p = self.pins[h]
                 ns = max(0.25, min(4.0, p.scale + step))
@@ -3459,15 +3579,8 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                 h = self.active_pin_index
 
             if h is not None and 0 <= h < len(self.pins):
-                deg = 15.0 if (e.state & Gdk.ModifierType.SHIFT_MASK) else 2.0
-
-                if e.direction == Gdk.ScrollDirection.UP:
-                    step = math.radians(deg)
-                elif e.direction == Gdk.ScrollDirection.DOWN:
-                    step = -math.radians(deg)
-                else:
-                    return True
-
+                deg = (15.0 if shift else 2.0) * delta
+                step = math.radians(deg)
                 self._begin_edit_burst()
                 p = self.pins[h]
                 c, s = math.cos(step), math.sin(step)
@@ -3488,15 +3601,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                 self.drawing_area.queue_draw()
                 return True
 
-        if e.direction == Gdk.ScrollDirection.UP:
-            s = 1.15
-        elif e.direction == Gdk.ScrollDirection.DOWN:
-            s = 1.0 / 1.15
-        else:
-            ok, _dx, dy = e.get_scroll_deltas()
-            if not ok or dy == 0:
-                return True
-            s = 1.15 ** (-dy)
+        s = 1.15 ** delta
         nz = max(0.05, min(10.0, self.zoom * s))
 
         self.pan_x = e.x - (e.x - self.pan_x) * (nz / self.zoom)
@@ -3781,6 +3886,7 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
                             tmp_cr.move_to(verts[i10][0], verts[i10][1])
                             tmp_cr.line_to(verts[i01][0], verts[i01][1])
                     cached_paths.append((rgba, tmp_cr.copy_path()))
+                tmp_cr = None
                 tmp_surf.finish()
                 self._mesh_path_cache = (mesh_sig, cached_paths)
 
@@ -4310,6 +4416,11 @@ Options > Extend image grows the layer (and its mask) when needed · Pin depth: 
             dst = getattr(self, "_dst_scaled", None)
 
             if dst is None or dst.get_width() != sw or dst.get_height() != sh:
+                if dst is not None:
+                    try:
+                        dst.finish()
+                    except Exception:
+                        pass
                 dst = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
                 self._dst_scaled = dst
 
