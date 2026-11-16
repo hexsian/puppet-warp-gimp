@@ -74,7 +74,6 @@ DIALOG_PID = os.path.join(GLib.get_tmp_dir(), "puppet-warp-dialog.pid")
 
 MAX_PINS = 256
 
-# Read once; debug prints in the draw path check this flag, not os.environ.
 _PW_DEBUG = bool(os.environ.get("PW_DEBUG"))
 
 _op_ready = False
@@ -124,6 +123,16 @@ def _load_arap_lib():
                 ctypes.c_int,
             ]
             lib.arap_grid_solve.restype = ctypes.c_int
+
+            if hasattr(lib, "arap_grid_solve_budget"):
+                lib.arap_grid_solve_budget.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_float,
+                    ctypes.c_int,
+                ]
+                lib.arap_grid_solve_budget.restype = ctypes.c_int
 
             lib.arap_grid_verts.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
             lib.arap_grid_verts.restype = ctypes.POINTER(ArapVec2)
@@ -185,6 +194,47 @@ def _load_arap_lib():
                 ]
                 lib.pw_render_preview_view_depth.restype = ctypes.c_int
 
+            has_ex_view = hasattr(lib, "pw_render_preview_view_ex")
+            if has_ex_view:
+                lib.pw_render_preview_view_ex.argtypes = view_argtypes + [
+                    ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_uint8)
+                ]
+                lib.pw_render_preview_view_ex.restype = ctypes.c_int
+
+            has_mip = hasattr(lib, "pw_mip_new") and hasattr(lib, "pw_mip_free")
+            if has_mip:
+                lib.pw_mip_new.argtypes = [
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
+                ]
+                lib.pw_mip_new.restype = ctypes.c_void_p
+                lib.pw_mip_free.argtypes = [ctypes.c_void_p]
+                lib.pw_mip_free.restype = None
+
+            has_vp = hasattr(lib, "pw_render_viewport")
+            if has_vp:
+                lib.pw_render_viewport.argtypes = [
+                    # dst (1-4)
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    # camera (5-7)
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    # active src + mip (8-12)
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                    # mesh + puppet rect (13-20)
+                    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    # flags + depth + active cells (21-26)
+                    ctypes.c_int, ctypes.c_float, ctypes.c_int,
+                    ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint8),
+                    # bg (27-34)
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                    # fg (35-42)
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                    ctypes.c_float, ctypes.c_float, ctypes.c_float,
+                ]
+                lib.pw_render_viewport.restype = ctypes.c_int
+
             if hasattr(lib, "arap_grid_add_pin_taper"):
                 lib.arap_grid_add_pin_taper.argtypes = [
                     ctypes.c_void_p,
@@ -197,9 +247,9 @@ def _load_arap_lib():
 
             print(
                 f"[puppet-warp] loaded {path} "
-                f"(c-preview={'yes' if has_preview else 'no'} "
-                f"view={'yes' if has_view else 'no'} "
-                f"depth={'yes' if has_depth_view else 'no'} "
+                f"(viewport={'yes' if has_vp else 'no'} "
+                f"mip={'yes' if has_mip else 'no'} "
+                f"ex={'yes' if has_ex_view else 'no'} "
                 f"reset={'yes' if has_reset else 'no'})"
             )
 
@@ -213,13 +263,14 @@ def _load_arap_lib():
 
 
 def _build_so():
+    global _op_freshly_installed
     srcs = (MW_C, AGRID_C)
-    
+
     try:
         os.makedirs(GEGL_USER_DIR, exist_ok=True)
     except Exception:
         return False
-        
+
     if (
         os.path.exists(MW_SO)
         and all(os.path.exists(s) for s in srcs)
@@ -230,6 +281,11 @@ def _build_so():
     if not all(os.path.exists(s) for s in srcs):
         return False
 
+    cc = os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        return False
+
+    tmp_so = MW_SO + ".tmp"
     try:
         pc = subprocess.run(
             ["pkg-config", "--cflags", "--libs", "gegl-0.4", "glib-2.0"],
@@ -244,7 +300,7 @@ def _build_so():
         omp_ok = False
         try:
             pr = subprocess.run(
-                ["gcc", "-fopenmp", "-x", "c", "-c", "/dev/null", "-o", os.devnull],
+                [cc, "-fopenmp", "-x", "c", "-c", os.devnull, "-o", os.devnull],
                 capture_output=True,
                 timeout=30,
             )
@@ -253,9 +309,11 @@ def _build_so():
             omp_ok = False
 
         flags = [
-            "gcc",
+            cc,
             "-O3",
             "-ftree-vectorize",
+            "-fno-math-errno",
+            "-fno-trapping-math",
             "-shared",
         ]
 
@@ -268,7 +326,7 @@ def _build_so():
         flags += [
             MW_C,
             AGRID_C,
-            "-o", MW_SO + ".tmp",
+            "-o", tmp_so,
             "-lm",
         ]
 
@@ -282,9 +340,26 @@ def _build_so():
             cwd=PLUGIN_DIR,
         )
 
-        if r.returncode == 0 and os.path.exists(MW_SO + ".tmp"):
-            os.replace(MW_SO + ".tmp", MW_SO)
-            return True
+        if r.returncode == 0 and os.path.exists(tmp_so):
+            try:
+                os.replace(tmp_so, MW_SO)
+                _op_freshly_installed = True
+                return True
+            except OSError as e:
+                if os.environ.get("PW_DEBUG"):
+                    print(f"[puppet-warp] replace failed: {e}")
+                try:
+                    if os.path.exists(tmp_so):
+                        os.unlink(tmp_so)
+                except Exception:
+                    pass
+                return False
+
+        if os.path.exists(tmp_so):
+            try:
+                os.unlink(tmp_so)
+            except Exception:
+                pass
 
         if os.environ.get("PW_DEBUG"):
             print("[puppet-warp] build failed:", r.stderr[-800:] if r.stderr else "")
@@ -292,12 +367,18 @@ def _build_so():
         return False
 
     except Exception as e:
+        try:
+            if os.path.exists(tmp_so):
+                os.unlink(tmp_so)
+        except Exception:
+            pass
         if os.environ.get("PW_DEBUG"):
             print(f"[puppet-warp] build exception: {e}")
         return False
 
+
 def _load_op():
-    for d in (PLUGIN_DIR, GEGL_USER_DIR):
+    for d in (GEGL_USER_DIR, PLUGIN_DIR):
         try:
             if os.path.isdir(d) and hasattr(Gegl, "load_directory"):
                 Gegl.load_directory(d)
@@ -325,9 +406,17 @@ def _pid_alive(pid):
             return True
 
     try:
-        return os.path.exists("/proc/%d" % pid)
-    except Exception:
+        os.kill(pid, 0)
         return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        try:
+            return os.path.exists("/proc/%d" % pid)
+        except Exception:
+            return True
 
 
 def _dialog_lock_acquire():
@@ -367,15 +456,20 @@ def ensure_op():
     if _op_ready:
         return True
 
-    for _name in (_LIB_NAME, "puppet-warp.so", "puppet-warp.dll"):
-        _p = os.path.join(PLUGIN_DIR, _name)
-        if os.path.exists(_p):
-            try:
-                os.unlink(_p)
-            except Exception:
-                pass
-
     _build_so()
+
+    if (
+        os.path.exists(MW_SO)
+        and os.path.abspath(PLUGIN_DIR) != os.path.abspath(GEGL_USER_DIR)
+    ):
+        for _name in (_LIB_NAME, "puppet-warp.so", "puppet-warp.dll"):
+            _p = os.path.join(PLUGIN_DIR, _name)
+            if os.path.exists(_p):
+                try:
+                    os.unlink(_p)
+                except Exception:
+                    pass
+
     _load_op()
     _load_arap_lib()
 
@@ -431,7 +525,6 @@ def _as_list(x):
 
 
 def _pw_lib_handle():
-    """Current ARAP library handle (module global lives here, not in callers)."""
     return _LIB
 
 

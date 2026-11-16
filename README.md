@@ -1,249 +1,154 @@
 # Puppet Warp (ARAP) for GIMP 3
 
-A non-destructive **puppet warp** filter for GIMP 3. Drop pins on a layer, drag
-them, and the image deforms *as rigidly as possible* (ARAP: as-rigid-as-possible
-deformation). Pins rotate, scale, taper, and carry a **depth** value so you can
-decide which part of the image overlaps in front when two regions cross. The
-warp lives as a regular GIMP layer filter, so you can close the dialog, keep
-editing, and reopen it later — nothing is baked in.
+A non-destructive **puppet warp** filter for GIMP 3. Drop pins on a layer, drag them, and the image deforms *as rigidly as possible* (ARAP: as-rigid-as-possible deformation). Pins rotate, scale, taper, and carry a **depth** value so you can decide which part of the image overlaps in front when two regions cross. The warp lives as a regular GIMP layer filter, so you can close the dialog, keep editing, and reopen it later — nothing is baked in.
+
+Equipped with an ultra-fast **C 1:1 Viewport Compositor**, hardware-accelerated **AVX2/FMA** routines, multi-level **Mipmap pyramids**, **Bicubic interpolation**, and alignment guides/snapping, the filter stays smooth and responsive (~60 FPS) even when working on large 4K/8K images with complex layer stacks.
 
 ## Features
 
-**Warping**
-
+### Warping & Rigidity
 - Click to add pins, drag to deform; Shift snaps a drag to an axis
-- Rotate and scale around any pin (orange ring: drag the dot to rotate, drag the
-  body to scale; or Alt+wheel / Ctrl+wheel)
-- Per-pin **taper** — how far a pin's influence reaches before it fades to the
-  rest of the mesh (Shift+wheel, or the `T` field)
-- Per-pin **depth** — when two warped regions overlap, higher depth draws in
-  front (`[` / `]`, or the `D` field). See [Pin depth](#pin-depth)
+- Rotate and scale around any pin (orange ring: drag the dot to rotate, drag the body to scale; or Alt+wheel / Ctrl+wheel)
+- Per-pin **taper** — how far a pin's influence reaches before it fades to the rest of the mesh (Shift+wheel, or the `T` field)
+- Per-pin **depth** — when two warped regions overlap, higher depth draws in front (`[` / `]`, or the `D` field). See [Pin depth](#pin-depth)
+- Custom pivot placement per pin (Ctrl+drag)
 - **Pin Edge** keeps the outer mesh border at its rest position
-- Stiffness mesh derived from the layer's alpha: transparent areas stay soft, so
-  a pin on empty background barely tugs the artwork
+- Adaptive stiffness mesh derived from the layer's alpha: transparent areas stay soft, while artwork silhouettes stay firm
 
-**Canvas & preview**
+### Canvas & Preview
+- **1:1 C Viewport Compositor**: Renders background, active warp, and foreground directly at screen viewport resolution using OpenMP + AVX2, bypassing heavy CPU scaling
+- **Mipmap Pyramid**: Automatically generates 1/2, 1/4, 1/8 downscaled textures for huge layers, eliminating zoom-out lag and pixel shimmering
+- **Preview Opacity**: Real-time 0–100% opacity slider to align artwork against underlying layers without affecting final export
+- **Layers Below & Layers Above**: Independently toggle and composite context layers:
+  - *Off* (none)
+  - *Nearest* (single visible layer immediately adjacent)
+  - *Composite* (stack of all visible layers)
+- **Mathematical Checkerboard**: Generated in zero-allocation RAM space
+- **Mesh Overlay**: Display as Cells, Triangles, Both, or Off with custom line color, backed by cached Cairo paths
+- **Extend Image**: Automatically grows the layer bounds (and its mask) if pixels are warped outside original edges
 
-- **Extend image** grows the layer when pins pull pixels outside its bounds; the
-  layer mask (if any) grows with it
-- Live preview with three background modes: *Below* (first visible layer under),
-  *Composite* (stack of all visible layers under), *Off*
-- Mesh overlay in four styles (Cells / Triangles / Both / Off) with a custom
-  line color, so you can see the quad grid while you work
-- Pan, zoom, fit-to-view; the view widens automatically to show extended pixels
+### Alignment & Guides
+- **Snapping (`Snap`)**: Snaps pin movements to Guides, Alignment Grid, and smart axis alignments with other pins
+- **Guides**: Automatically loads GIMP image guides (Cyan); allows creating, dragging, and deleting custom local guides (Magenta)
+- **Alignment Grid**: Configurable pixel-grid overlay (`Step px`) independent of the ARAP deformation mesh
 
-**Workflow**
-
-- Undo / redo inside the dialog (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y)
+### Workflow, Comparison & Multi-Layer Export
+- **Snapshots (`A`, `B`, `C`)**: Quick one-click state slots to save, restore, overwrite, or clear setup variations
+- **`A⇄B⇄C` Compare & Cycle (`→` / `` ` ``)**: Non-destructively toggle or step sequentially through all saved variations (`Live → A → B → C → Live`) without losing unsaved work
+- **`Export A-C` to New Layers**: Optionally export all saved snapshots (`A`, `B`, `C`) as separate, non-destructive layers above the active layer when applying (`OK`), each with its own editable Puppet Warp filter and `Extend Image` bounds
+- **`Orig` Before/After (`\`)**: Instant visual comparison against the unwarped original layer
+- Full-state undo / redo inside the dialog (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y)
 - Multi-select pins (Shift+click, Ctrl+A), nudge with arrow keys (Shift = 10 px)
-- Save / load the whole setup (pins, depth, taper, grid, options) as a JSON
-  **preset**
-- Non-destructive: every parameter is stored as JSON on the layer filter and
-  travels with the `.xcf`. Reopen the tool to continue editing — including after
-  an extend, where the padding is re-detected so pins never drift
+- Save / load setups (pins, depth, taper, guides, options) as JSON **presets**
+- Non-destructive & Locale-safe: Full parameter persistence via GEGL filter config; unaffected by system comma/period decimal settings
 
 ## Requirements
 
-- GIMP 3.2 (Python plug-ins enabled, which is the default)
-- Windows x64, or Linux x86_64
-- **NumPy is optional but recommended.** Without it, alpha-derived stiffness and
-  some reopen heuristics are skipped; the warp itself still works.
+- GIMP 3.2 (Python plug-ins enabled, default)
+- Windows x64 or Linux x86_64
+- **NumPy is optional but strongly recommended.** Without it, alpha stiffness and vector bounding box optimizations fall back to slower pure-Python loops.
 
 ## Demo
 
-
-
 https://github.com/user-attachments/assets/5bd12069-d2a2-4147-b73a-235c6677b966
-
-
 
 ## How to use
 
 The filter appears in two menus:
-
 - Filters ▸ Deform ▸ Puppet Warp (ARAP)…
 - Tools ▸ Transform Tools ▸ Puppet Warp (ARAP)…
 
-Isolate the part you want to warp onto **its own layer** first — puppet warp
-deforms the whole layer, so a clean cutout gives the cleanest result.
+Isolate the part you want to warp onto **its own layer** first — puppet warp deforms the entire layer, so a clean cutout gives the cleanest result.
 
 ## Install
 
-Grab the prebuilt binary for your system from `binaries/`:
-
-| Platform | File | Requirements |
-| --- | --- | --- |
-| Linux x86_64 | [`binaries/linux-x86_64/puppet-warp.so`](binaries/linux-x86_64/puppet-warp.so) | glibc ≥ 2.38 (Ubuntu 24.04+, Fedora 39+, Arch, Debian 13+) |
-| Windows x64 | [`binaries/windows-x64/puppet-warp.dll`](binaries/windows-x64/puppet-warp.dll) | Windows 10+ (UCRT); depends only on DLLs shipped with GIMP |
-
-Or download a packaged zip from the [Releases](../../releases) page.
-
 ### Windows
-
-1. Extract the zip. You get a folder named `puppet-warp`.
-2. Copy that folder to `%APPDATA%\GIMP\3.2\plug-ins\`
-   (final path: `%APPDATA%\GIMP\3.2\plug-ins\puppet-warp\puppet-warp.py`).
-3. Start GIMP and run the filter once. The plug-in copies `puppet-warp.dll` to
-   `%LOCALAPPDATA%\gegl-0.4\plug-ins\` and tells you to restart GIMP.
-4. Restart GIMP once. After that the filter works normally.
-
-If the automatic copy fails, copy `puppet-warp.dll` to
-`%LOCALAPPDATA%\gegl-0.4\plug-ins\` yourself (create the folders if missing) and
-restart GIMP. To update later, close GIMP first: Windows will not overwrite a
-DLL that GIMP has loaded.
+1. Download or extract the plugin files into `%APPDATA%\GIMP\3.2\plug-ins\puppet-warp\`
+   (ensure `puppet-warp.py`, `puppet_warp_extras.py`, `puppet_warp_native.py`, `puppet_warp_resize.py`, and `puppet-warp.dll` are in this folder).
+2. Start GIMP and run the filter once. The plug-in automatically loads or installs `puppet-warp.dll` into `%LOCALAPPDATA%\gegl-0.4\plug-ins\` and prompts for a restart if newly installed.
+3. Restart GIMP.
 
 ### Linux
-
 ```sh
-mkdir -p ~/.config/GIMP/3.2/plug-ins
-cp -r puppet-warp ~/.config/GIMP/3.2/plug-ins/
+mkdir -p ~/.config/GIMP/3.2/plug-ins/puppet-warp
+cp * ~/.config/GIMP/3.2/plug-ins/puppet-warp/
 chmod +x ~/.config/GIMP/3.2/plug-ins/puppet-warp/puppet-warp.py
 ```
-
-Start GIMP, run the filter once, then restart GIMP so it picks up the GEGL
-operation (it is copied to `~/.local/share/gegl-0.4/plug-ins/`).
-
-The prebuilt `puppet-warp.so` needs **glibc 2.38 or newer** (Ubuntu 24.04,
-Fedora 39+, Arch, Debian 13). On an older distribution, build it yourself
-(next section); the plug-in also builds it automatically on first run when
-`gcc` and the development packages are installed.
+Start GIMP, run the filter once, then restart GIMP so GEGL registers `custom:puppet-warp` from `~/.local/share/gegl-0.4/plug-ins/`.
 
 ## Build from source
 
-Sources: `puppet-warp.c` (GEGL operation + preview renderer) and `arap_grid.c`
-(ARAP solver). They compile into one shared library.
+Sources: `puppet-warp.c` (GEGL op + viewport compositor + mipmap pyramid) and `arap_grid.c` (banded Cholesky ARAP solver).
 
-The plug-in auto-builds this on first run when the toolchain is present, using
-the flags below (OpenMP is added automatically if the compiler supports it).
-
-**Linux** (needs `gcc`, `pkg-config`, and the GEGL / GLib dev packages):
-
+**Linux** (`gcc`, `pkg-config`, `gegl-0.4`, `glib-2.0`):
 ```sh
-gcc -O3 -ftree-vectorize -shared -fPIC -fopenmp \
+gcc -O3 -ftree-vectorize -fno-math-errno -fno-trapping-math -shared -fPIC -fopenmp \
     puppet-warp.c arap_grid.c -o puppet-warp.so -lm \
     $(pkg-config --cflags --libs gegl-0.4 glib-2.0)
 ```
+*(Add `-std=gnu17` if compiling on modern GCC targeting older glibc distributions).*
 
-Drop `-fopenmp` if your compiler lacks OpenMP — the preview simply runs
-single-threaded. To target an **older glibc**, add `-std=gnu17`: newer GCC
-defaults to C23, which pulls in glibc 2.38 symbols that won't load on, say,
-Debian 12.
-
-**Windows** (MSYS2, **UCRT64** shell):
-
+**Windows** (MSYS2 UCRT64 shell):
 ```sh
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf \
     mingw-w64-ucrt-x86_64-gegl mingw-w64-ucrt-x86_64-cairo
-gcc -O3 -ftree-vectorize -shared \
+gcc -O3 -ftree-vectorize -fno-math-errno -fno-trapping-math -shared -fopenmp \
     puppet-warp.c arap_grid.c -o puppet-warp.dll -lm \
     $(pkg-config --cflags --libs gegl-0.4 glib-2.0)
 ```
 
-The DLL only depends on libraries that ship with GIMP (`libgegl`, `libbabl`,
-`libglib`, `libgobject`) plus the Windows UCRT. Put the result next to
-`puppet-warp.py`.
-
 ## Controls
-
-Everything happens on the canvas. The pin inspector row (rotation, scale, taper,
-depth, pivot) appears only when a pin is selected.
 
 | Action | Control |
 | --- | --- |
-| Add a pin | Click empty space |
-| Move a pin | Drag it |
-| Move several pins | Shift+click to add to selection, then drag any selected pin |
-| Select all pins | Ctrl+A |
-| Clear selection | Alt+Esc |
-| Nudge selected pins | Arrow keys (Shift = 10 px) |
-| Delete a pin | Right-click, Alt+click, or Delete |
-| Reset a pin to rest | Double-click the pin |
-| Rotate | Drag the dot on the orange ring, or Alt+wheel (Shift = bigger steps) |
-| Scale | Drag the ring body, or Ctrl+wheel (Shift = bigger steps) |
-| Clear rotate/scale | Double-click the ring |
-| Move a pin's pivot | Ctrl+drag on the canvas |
-| Taper (influence reach) | Shift+wheel over a pin, or the `T` field |
-| Depth (overlap order) | `[` = send back, `]` = bring front, or the `D` field |
-| Zoom / pan | Wheel / middle-drag |
-| Fit view | `Fit` button |
-| Reset all deformation | `Reset` button (keeps pins) |
-| Remove all pins | `Clear` button |
-| Undo / redo | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) |
-| Apply | Enter or `OK` |
-| Cancel | Esc or `Cancel` |
-
-### Options (popover, top row)
-
-| Control | What it does |
-| --- | --- |
-| **Alpha stiffness** | Use the layer's alpha as solver stiffness. Off = uniform mesh. Soft (transparent) cells show red in the overlay. |
-| **Pin edge** | Hold the outer mesh border at rest. |
-| **Rotate/scale** | Allow pins to rotate/scale. Turning it off mutes the values without discarding them. |
-| **Extend image** | Grow the layer (and its mask) when pins pull pixels outside bounds. |
-| **BG** | Preview background: Off / Below / Composite. |
-| **Presets** | Save / load pins + settings as JSON. |
+| **Add pin** | Click empty space |
+| **Move pin** | Drag it |
+| **Multi-select pins** | Shift+click to toggle selection, then drag any selected pin |
+| **Select / Clear all pins** | Ctrl+A (all) / Alt+Esc (clear selection) |
+| **Nudge pins** | Arrow keys (Shift = 10 px) |
+| **Delete pin** | Right-click, Alt+click, or Delete |
+| **Reset pin to rest** | Double-click the pin |
+| **Rotate** | Drag dot on orange ring, or Alt+wheel (Shift = 15° steps) |
+| **Scale** | Drag orange ring body, or Ctrl+wheel (Shift = 10% steps) |
+| **Clear rotate / scale** | Double-click the orange ring |
+| **Move pin pivot** | Ctrl+drag on canvas |
+| **Taper (influence reach)** | Shift+wheel over pin, or `T` spinbox |
+| **Depth (overlap order)** | `[` = send back, `]` = bring front, or `D` spinbox |
+| **Cycle snapshots (`A → B → C → Live`)** | `` ` `` (backtick/grave), `→` button, or Right-click `A⇄B⇄C` |
+| **Before / After toggle** | `\` (backslash) or `Orig` button |
+| **Guides toggle** | Ctrl+; or `Guides` button |
+| **Add / Move Guide** | Drag top / left edge tabs; right-click tab to remove |
+| **Zoom / Pan** | Scroll wheel / Middle-drag |
+| **Fit view** | `Fit` button |
+| **Reset deformation** | `Reset` button (preserves pins) |
+| **Remove all pins** | `Clear` button |
+| **Undo / Redo** | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) |
+| **Apply / Cancel** | Enter (`OK`) / Esc (`Cancel`) |
 
 ### Pin depth
 
-When you drag two parts of the image so they overlap, depth decides which one is
-in front — the same idea as Photoshop's Pin Depth.
+When warped areas overlap, depth decides which region renders in front:
+1. Select a pin in the target area.
+2. Press **`]`** to bring forward or **`[`** to send backward (shows as `d=+1`, `d=-2`, etc.).
+3. Triangle depth interpolates to the maximum depth of its vertices, matching Photoshop-style front-bleeding.
+4. Depth is resolved via back-to-front sorted triangle blending inside the C viewport compositor and depth-aware compositing in the final GEGL filter.
 
-1. Click a pin in the region you want to control.
-2. Press **`]`** to bring it forward, **`[`** to send it back. The number shows
-   next to the pin (`d=+2`) and in the `D` field.
-3. Depth is per-pin; a triangle's depth is the highest depth among its three
-   corners, so a front region "bleeds" slightly past its border, like Photoshop.
+### Snapshots, A-B-C Compare & Layer Export
 
-Depth is a rendering order, not a solver input — changing it does not re-solve
-the mesh, so it's instant. It is saved with the pin, travels in the preset, and
-survives reopen. With a current build, the live preview uses the same z-buffer
-rule as the final render, so what you see is what you get.
+- **Slots `A`, `B`, `C`**: Click to save/load. Shift+click (or Right-click) to overwrite. Alt+click (or Middle-click) to clear.
+- **`A⇄B⇄C` & `→` (`` ` ``)**:
+  - Click **`A⇄B⇄C`** to toggle a non-destructive preview against the active compare slot without erasing or altering your live work (Right-click **`A⇄B⇄C`** to jump to the next saved slot).
+  - Click **`→`** (or press **`` ` ``**) to step sequentially through all saved snapshots and back to your live edit (`Live → A → B → C → Live`).
+  - Clicking the canvas while peeking keeps the displayed snapshot for editing and pushes your previous live state onto the Undo stack (`Ctrl+Z` restores it).
+- **`Export A-C`**:
+  - Enable **`Export A-C`** before pressing **`OK`** to export every saved snapshot (`A`, `B`, `C`) as a separate layer right above the active layer (`<Layer> [Warp A]`, `[Warp B]`, `[Warp C]`).
+  - Each exported layer remains fully non-destructive with its own editable Puppet Warp filter and independent `Extend Image` padding, grouped into a single GIMP undo step.
 
-> Tip: depth matters most on cutouts with hard edges. On heavily feathered
-> borders the overlap is a soft blend either way, and the exact ordering is less
-> visible.
+## Troubleshooting & Environment Variables
 
-## How it works
-
-`arap_grid.c` builds a regular vertex grid over the layer and solves ARAP with a
-banded Cholesky factorization. Pins are hard constraints; a rotate/scale pin
-becomes a smooth similarity ring; taper controls how fast a pin's influence
-falls off.
-
-`puppet-warp.c` registers the GEGL operation `custom:puppet-warp`. The **apply**
-path inverse-maps every grid triangle from the solved mesh into the output
-buffer. The **preview** path is a separate fast rasterizer (premultiplied ARGB32,
-bilinear, OpenMP over horizontal bands) so dragging stays responsive; when pin
-depth is active it uses a per-pixel z-buffer so the preview's overlap order
-matches the final render.
-
-The Python UI drives both and stores every parameter — pins, rotation, scale,
-taper, depth, grid size, options, and the solved vertices — as JSON on the layer
-filter. There is no sidecar file: the vertices ride in the filter params, so
-reopen is exact and the `.xcf` stays self-contained.
-
-**Extend** pads the layer to fit the deformed bounds. For the mask, the plug-in
-does not try to rebuild it by hand (GIMP 3's Python bindings expose no reliable
-way to create/attach a layer mask); instead it resizes the layer and lets GIMP's
-own core cascade the mask to the new size, then verifies the mask actually grew.
-If it didn't, the resize is rolled back and extend is skipped for that layer
-rather than leaving the mask drifted. Set `PW_NO_MASK_EXTEND=1` to opt into the
-old behavior (pad the layer, leave the mask alone) if you specifically want that.
-
-## Troubleshooting
-
-- Start GIMP with `PW_DEBUG=1` for verbose logs (solver timings, preview path,
-  extend/measure decisions, depth preview mode).
-- `PW_NO_C_PREVIEW=1` forces the slower Python preview renderer. Useful to
-  compare, or if a GPU/driver quirk shows in the C path.
-- `PW_NO_BG=1` hides background layers in the preview.
-- `PW_PREVIEW_SCALE=0.5` caps the preview raster resolution (0.25–1.0). Lower it
-  on very large layers if dragging feels heavy.
-- `PW_NO_MASK_EXTEND=1` makes Extend pad the layer but ignore the mask (legacy;
-  the mask will not follow the layer).
-- Filter missing, or the layer looks unchanged after applying: restart GIMP once
-  so it loads the GEGL operation, and confirm `puppet-warp.dll` / `.so` is in the
-  GEGL plug-in folder listed above.
-- Pin depth preview falls back to the Python renderer (slower) if your
-  `puppet-warp.so` predates the depth z-buffer export. Rebuild it (see *Build
-  from source*) to get the fast, apply-matching preview.
+- `PW_DEBUG=1`: Prints solver iteration counters, viewport compositor timings (`[pw-c-vp]`), and GEGL chunk processing metrics.
+- `PW_APPLY_BICUBIC=1`: Forces high-quality Catmull-Rom Bicubic filtering on final layer apply (default applies fast Bilinear).
+- `PW_NO_C_PREVIEW=1`: Forces fallback to the slower Python/Cairo preview renderer.
+- `PW_NO_BG=1`: Disables all background layer compositing.
+- `PW_PREVIEW_SCALE=0.5`: Clamps viewport preview scale (0.25–1.0) on ultra-high-resolution canvases.
+- `PW_NO_MASK_EXTEND=1`: Pads the layer bounds but ignores the layer mask on extend.

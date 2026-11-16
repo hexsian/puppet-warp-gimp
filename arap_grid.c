@@ -4,6 +4,18 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <time.h>
+#ifdef _WIN32
+# include <windows.h>
+#endif
+
+/* AVX2+FMA path: compiled per function (no global -mavx2) and chosen at run
+   time, so the library still loads on CPUs without AVX2. */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+# include <immintrin.h>
+# define ARAP_HAVE_X86_SIMD 1
+# define ARAP_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#endif
 
 #if defined(_WIN32)
 # define PW_EXPORT __declspec(dllexport)
@@ -43,6 +55,48 @@ fnv_mix (unsigned long long h, const void *p, size_t n)
     return h;
 }
 
+/* Monotonic clock in microseconds, for the solve time budget. */
+static long long
+now_us (void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER t;
+
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency (&freq);
+
+    QueryPerformanceCounter (&t);
+    return (long long)((t.QuadPart / freq.QuadPart) * 1000000LL +
+                       (t.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart);
+#else
+    struct timespec ts;
+
+    clock_gettime (CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + (long long)(ts.tv_nsec / 1000L);
+#endif
+}
+
+static int
+arap_use_avx2 (void)
+{
+#ifdef ARAP_HAVE_X86_SIMD
+    static int state = -1;
+
+    if (state < 0)
+    {
+        __builtin_cpu_init ();
+        state = __builtin_cpu_supports ("avx2") &&
+                __builtin_cpu_supports ("fma") &&
+                getenv ("PW_NO_AVX2") == NULL;
+    }
+
+    return state;
+#else
+    return 0;
+#endif
+}
+
 typedef struct {
     int cols, rows, nv, nc, band;
 
@@ -80,6 +134,10 @@ typedef struct {
     int acc_dirty;
 
     double *rx, *ry, *xx, *yy;
+    double *xxb, *yyb;      /* zero-padded allocations behind xx / yy */
+    double *tux, *tuy, *tvx, *tvy;  /* per-row cell terms used by build_rhs */
+    double *F, *Bk, *invd;  /* solve-friendly copies of the Cholesky factor */
+    int bwp;                /* band rounded up to a multiple of 8 */
     ArapVec2 *out;
 } ArapGrid;
 
@@ -192,8 +250,23 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
 
     g->rx = malloc ((size_t)g->nv * sizeof (double));
     g->ry = malloc ((size_t)g->nv * sizeof (double));
-    g->xx = malloc ((size_t)g->nv * sizeof (double));
-    g->yy = malloc ((size_t)g->nv * sizeof (double));
+    /* xx / yy carry bwp zeros on each side so the solve can read a full
+       window of x without bounds checks. */
+    g->bwp = (g->band + 7) & ~7;
+    g->xxb = calloc ((size_t)g->nv + 2 * (size_t)g->bwp, sizeof (double));
+    g->yyb = calloc ((size_t)g->nv + 2 * (size_t)g->bwp, sizeof (double));
+    g->xx = g->xxb ? g->xxb + g->bwp : NULL;
+    g->yy = g->yyb ? g->yyb + g->bwp : NULL;
+    g->F    = calloc ((size_t)g->nv * (size_t)g->bwp, sizeof (double));
+    g->Bk   = calloc ((size_t)g->nv * (size_t)g->bwp, sizeof (double));
+    g->invd = malloc ((size_t)g->nv * sizeof (double));
+    g->tux  = malloc ((size_t)cols * 4 * sizeof (double));
+    if (g->tux)
+    {
+        g->tuy = g->tux + cols;
+        g->tvx = g->tuy + cols;
+        g->tvy = g->tvx + cols;
+    }
 
     g->A = malloc ((size_t)g->nv * (g->band + 1) * sizeof (double));
     g->L = malloc ((size_t)g->nv * (g->band + 1) * sizeof (double));
@@ -215,7 +288,7 @@ arap_grid_new (float x, float y, float w, float h, int cols, int rows)
 
     if (!g->sx || !g->sy || !g->dx || !g->dy || !g->cw ||
         !g->ea || !g->eb || !g->ex || !g->ey || !g->out ||
-        !g->rx || !g->ry || !g->xx || !g->yy ||
+        !g->rx || !g->ry || !g->xx || !g->yy || !g->F || !g->Bk || !g->invd || !g->tux ||
         !g->A || !g->L || !g->accW || !g->accTX || !g->accTY || !g->hard ||
         !g->bnd || !g->bndRX || !g->bndRY ||
         !g->regRX || !g->regRY || !g->accRX || !g->accRY)
@@ -621,12 +694,36 @@ apply_sim (ArapGrid *g)
     g->acc_dirty = 1;
 }
 
+static inline double
+chol_dot (const double * __restrict__ p, const double * __restrict__ q, int n)
+{
+    double acc = 0.0;
+    int t;
+
+    for (t = 0; t < n; t++)
+        acc += p[t] * q[t];
+
+    return acc;
+}
+
+static inline double
+chol_norm2 (const double * __restrict__ p, int n)
+{
+    double acc = 0.0;
+    int t;
+
+    for (t = 0; t < n; t++)
+        acc += p[t] * p[t];
+
+    return acc;
+}
+
 /* Returns 1 if the factor was rebuilt, 0 if reused. */
 static int
 ensure_factor (ArapGrid *g)
 {
     unsigned long long sig;
-    int i, j, t;
+    int i, j;
     int stride = g->band + 1;
 
     /* Fingerprint of everything that enters the matrix A. Pin targets and
@@ -714,12 +811,13 @@ ensure_factor (ArapGrid *g)
         {
             double s = Ai[i - j];
             double *Lj = g->L + (size_t)j * stride;
-
-            for (t = jmin; t < j; t++)
-                s -= Li[i - t] * Lj[j - t];
+            int len = j - jmin;
 
             if (j == i)
             {
+                if (len > 0)
+                    s -= chol_norm2 (Li + 1, len);
+
                 if (s < ARAP_CHOL_MIN)
                     s = ARAP_CHOL_MIN;
 
@@ -727,7 +825,44 @@ ensure_factor (ArapGrid *g)
             }
             else
             {
+                if (len > 0)
+                    s -= chol_dot (Li + (i - j + 1), Lj + 1, len);
+
                 Li[i - j] = s / Lj[0];
+            }
+        }
+    }
+
+    /* Row-contiguous copies of L for the substitutions:
+         F[i][k]  = L(i, i - bwp + k)       forward  : dot with x[i-bwp .. i-1]
+         Bk[i][k] = L(i + 1 + k, i)         backward : dot with x[i+1 .. i+bwp]
+       so both are plain dot products over contiguous memory (the old backward
+       pass walked L down a column, one cache line per element). Positions
+       outside the band stay zero. */
+    {
+        int n = g->nv, bw = g->band, bwp = g->bwp, k;
+
+        for (i = 0; i < n; i++)
+        {
+            double *Fi = g->F  + (size_t)i * bwp;
+            double *Bi = g->Bk + (size_t)i * bwp;
+            const double *Li = g->L + (size_t)i * stride;
+
+            g->invd[i] = 1.0 / Li[0];
+
+            for (k = 0; k < bwp; k++)
+            {
+                int t = i - bwp + k;
+
+                Fi[k] = (t >= 0 && i - t <= bw) ? Li[i - t] : 0.0;
+            }
+
+            for (k = 0; k < bwp; k++)
+            {
+                int t = i + 1 + k;
+
+                Bi[k] = (t < n && t - i <= bw)
+                      ? g->L[(size_t)t * stride + (t - i)] : 0.0;
             }
         }
     }
@@ -738,8 +873,8 @@ ensure_factor (ArapGrid *g)
     return 1;
 }
 
-static void
-band_solve2 (ArapGrid *g, double *rx, double *ry, double *x, double *y)
+static void __attribute__((unused))
+band_solve2_ref (ArapGrid *g, double *rx, double *ry, double *x, double *y)
 {
     int i, t;
     int n = g->nv;
@@ -796,65 +931,206 @@ band_solve2 (ArapGrid *g, double *rx, double *ry, double *x, double *y)
     }
 }
 
+/* Two dot products against the same coefficient row (x and y share the
+   factor, so each coefficient is loaded once for both). n is a multiple of 8. */
+static inline void
+dot2_scalar (const double *c, const double *x, const double *y, int n,
+             double *ox, double *oy)
+{
+    double ax0 = 0.0, ax1 = 0.0, ay0 = 0.0, ay1 = 0.0;
+    int k;
+
+    for (k = 0; k < n; k += 2)
+    {
+        ax0 += c[k]     * x[k];
+        ax1 += c[k + 1] * x[k + 1];
+        ay0 += c[k]     * y[k];
+        ay1 += c[k + 1] * y[k + 1];
+    }
+
+    *ox = ax0 + ax1;
+    *oy = ay0 + ay1;
+}
+
+#ifdef ARAP_HAVE_X86_SIMD
+static inline __attribute__((always_inline, target("avx2,fma"))) void
+dot2_avx2 (const double *c, const double *x, const double *y, int n,
+           double *ox, double *oy)
+{
+    __m256d ax0 = _mm256_setzero_pd (), ax1 = _mm256_setzero_pd ();
+    __m256d ay0 = _mm256_setzero_pd (), ay1 = _mm256_setzero_pd ();
+    __m128d hx, hy;
+    int k;
+
+    for (k = 0; k < n; k += 8)
+    {
+        __m256d c0 = _mm256_loadu_pd (c + k);
+        __m256d c1 = _mm256_loadu_pd (c + k + 4);
+
+        ax0 = _mm256_fmadd_pd (c0, _mm256_loadu_pd (x + k),     ax0);
+        ax1 = _mm256_fmadd_pd (c1, _mm256_loadu_pd (x + k + 4), ax1);
+        ay0 = _mm256_fmadd_pd (c0, _mm256_loadu_pd (y + k),     ay0);
+        ay1 = _mm256_fmadd_pd (c1, _mm256_loadu_pd (y + k + 4), ay1);
+    }
+
+    ax0 = _mm256_add_pd (ax0, ax1);
+    ay0 = _mm256_add_pd (ay0, ay1);
+
+    hx = _mm_add_pd (_mm256_castpd256_pd128 (ax0), _mm256_extractf128_pd (ax0, 1));
+    hy = _mm_add_pd (_mm256_castpd256_pd128 (ay0), _mm256_extractf128_pd (ay0, 1));
+
+    *ox = _mm_cvtsd_f64 (_mm_add_sd (hx, _mm_unpackhi_pd (hx, hx)));
+    *oy = _mm_cvtsd_f64 (_mm_add_sd (hy, _mm_unpackhi_pd (hy, hy)));
+}
+
+static ARAP_TARGET_AVX2 void
+band_solve_avx2 (ArapGrid *g, const double *rx, const double *ry,
+                 double *x, double *y)
+{
+    const int n = g->nv, bw = g->bwp;
+    int i;
+
+    for (i = 0; i < n; i++)
+    {
+        double sx, sy;
+
+        dot2_avx2 (g->F + (size_t)i * bw, x + i - bw, y + i - bw, bw, &sx, &sy);
+        x[i] = (rx[i] - sx) * g->invd[i];
+        y[i] = (ry[i] - sy) * g->invd[i];
+    }
+
+    for (i = n - 1; i >= 0; i--)
+    {
+        double sx, sy;
+
+        dot2_avx2 (g->Bk + (size_t)i * bw, x + i + 1, y + i + 1, bw, &sx, &sy);
+        x[i] = (x[i] - sx) * g->invd[i];
+        y[i] = (y[i] - sy) * g->invd[i];
+    }
+}
+#endif
+
+static void
+band_solve_scalar (ArapGrid *g, const double *rx, const double *ry,
+                   double *x, double *y)
+{
+    const int n = g->nv, bw = g->bwp;
+    int i;
+
+    for (i = 0; i < n; i++)
+    {
+        double sx, sy;
+
+        dot2_scalar (g->F + (size_t)i * bw, x + i - bw, y + i - bw, bw, &sx, &sy);
+        x[i] = (rx[i] - sx) * g->invd[i];
+        y[i] = (ry[i] - sy) * g->invd[i];
+    }
+
+    for (i = n - 1; i >= 0; i--)
+    {
+        double sx, sy;
+
+        dot2_scalar (g->Bk + (size_t)i * bw, x + i + 1, y + i + 1, bw, &sx, &sy);
+        x[i] = (x[i] - sx) * g->invd[i];
+        y[i] = (y[i] - sy) * g->invd[i];
+    }
+}
+
+/* x and y must be g->xx / g->yy: they have bwp zero entries on both sides. */
+static void
+band_solve2 (ArapGrid *g, double *rx, double *ry, double *x, double *y)
+{
+#ifdef ARAP_HAVE_X86_SIMD
+    if (arap_use_avx2 ())
+    {
+        band_solve_avx2 (g, rx, ry, x, y);
+        return;
+    }
+#endif
+    band_solve_scalar (g, rx, ry, x, y);
+}
+
+/* Local/global right-hand side.
+
+   For a rest cell of size (w, h) with corners p00 p10 / p01 p11, the six edge
+   terms of the Procrustes fit collapse to two corner differences:
+       H = (p10 + p11) - (p00 + p01)      V = (p01 + p11) - (p00 + p10)
+       cs = w*Hx + h*Vy                   ss = w*Hy - h*Vx
+   and, with R = (cr, sr) the best rotation, the edge contributions to the
+   right-hand side collapse to two vectors per cell:
+       u = 2 wc R (w, h)    -> v00 -= u,  v11 += u
+       v = 2 wc R (w, -h)   -> v10 += v,  v01 -= v
+   (the cell weight wc is 0 for transparent cells, which then add nothing).
+   This replaces 12 indexed edge visits per cell with straight-line row loops.
+   The rest grid is regular, so w and h are the same for every cell. */
 static void
 build_rhs (ArapGrid *g)
 {
-    int c, i, e;
+    const int cols = g->cols, rows = g->rows, vs = cols + 1;
+    const double cwd = (double)(g->sx[1] - g->sx[0]);
+    const double chd = (double)(g->sy[vs] - g->sy[0]);
+    const float *dx = g->dx, *dy = g->dy;
     double *rx = g->rx;
     double *ry = g->ry;
+    double *ux = g->tux, *uy = g->tuy, *vx = g->tvx, *vy = g->tvy;
+    int i, r, c;
 
     memset (rx, 0, (size_t)g->nv * sizeof (double));
     memset (ry, 0, (size_t)g->nv * sizeof (double));
 
-    for (c = 0; c < g->nc; c++)
+    for (r = 0; r < rows; r++)
     {
-        double w = g->cw[c];
-        double cs = 0.0, ss = 0.0, nrm, cr, sr;
-        int base = c * ARAP_EDGES;
+        const float *x0 = dx + (size_t)r * vs, *x1 = x0 + vs;
+        const float *y0 = dy + (size_t)r * vs, *y1 = y0 + vs;
+        const float *wr = g->cw + (size_t)r * cols;
+        double *rx0 = rx + (size_t)r * vs, *rx1 = rx0 + vs;
+        double *ry0 = ry + (size_t)r * vs, *ry1 = ry0 + vs;
 
-        if (w <= 0.0)
-            continue;
-
-        for (e = 0; e < ARAP_EDGES; e++)
+        for (c = 0; c < cols; c++)
         {
-            int a = g->ea[base + e];
-            int b = g->eb[base + e];
-            double svx = g->ex[base + e];
-            double svy = g->ey[base + e];
-            double dvx = g->dx[b] - g->dx[a];
-            double dvy = g->dy[b] - g->dy[a];
+            double w2 = 2.0 * (double)wr[c];
+            double hx, hy, vxd, vyd, cs, ss, nrm, cr, sr;
 
-            cs += svx * dvx + svy * dvy;
-            ss += svx * dvy - svy * dvx;
+            if (w2 <= 0.0)
+            {
+                ux[c] = 0.0;
+                uy[c] = 0.0;
+                vx[c] = 0.0;
+                vy[c] = 0.0;
+                continue;
+            }
+
+            hx  = ((double)x0[c + 1] + x1[c + 1]) - ((double)x0[c] + x1[c]);
+            hy  = ((double)y0[c + 1] + y1[c + 1]) - ((double)y0[c] + y1[c]);
+            vxd = ((double)x1[c] + x1[c + 1]) - ((double)x0[c] + x0[c + 1]);
+            vyd = ((double)y1[c] + y1[c + 1]) - ((double)y0[c] + y0[c + 1]);
+            cs  = cwd * hx + chd * vyd;
+            ss  = cwd * hy - chd * vxd;
+            nrm = sqrt (cs * cs + ss * ss);
+
+            if (nrm > 2e-9)
+            {
+                double inv = 1.0 / nrm;
+                cr = cs * inv;
+                sr = ss * inv;
+            }
+            else
+            {
+                cr = 1.0;
+                sr = 0.0;
+            }
+
+            ux[c] = w2 * (cr * cwd - sr * chd);
+            uy[c] = w2 * (sr * cwd + cr * chd);
+            vx[c] = w2 * (cr * cwd + sr * chd);
+            vy[c] = w2 * (sr * cwd - cr * chd);
         }
 
-        nrm = sqrt (cs * cs + ss * ss);
-
-        if (nrm > 1e-9)
-        {
-            cr = cs / nrm;
-            sr = ss / nrm;
-        }
-        else
-        {
-            cr = 1.0;
-            sr = 0.0;
-        }
-
-        for (e = 0; e < ARAP_EDGES; e++)
-        {
-            int a = g->ea[base + e];
-            int b = g->eb[base + e];
-            double svx = g->ex[base + e];
-            double svy = g->ey[base + e];
-            double tx = cr * svx - sr * svy;
-            double ty = sr * svx + cr * svy;
-
-            rx[a] -= w * tx;
-            rx[b] += w * tx;
-            ry[a] -= w * ty;
-            ry[b] += w * ty;
-        }
+        /* separate loops: each touches an element once, so they vectorise */
+        for (c = 0; c < cols; c++) { rx0[c]     -= ux[c]; ry0[c]     -= uy[c]; }
+        for (c = 0; c < cols; c++) { rx0[c + 1] += vx[c]; ry0[c + 1] += vy[c]; }
+        for (c = 0; c < cols; c++) { rx1[c]     -= vx[c]; ry1[c]     -= vy[c]; }
+        for (c = 0; c < cols; c++) { rx1[c + 1] += ux[c]; ry1[c + 1] += uy[c]; }
     }
 
     for (i = 0; i < g->npin; i++)
@@ -906,16 +1182,14 @@ fill_out (ArapGrid *g)
     }
 }
 
-PW_EXPORT int
-arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
+static int
+arap_solve_impl (void *handle, int iters, float tol, int warm, long long budget_us)
 {
     ArapGrid *g = handle;
     double max_pin_disp = 0.0, limit;
     int it, i;
     int factor_new;
-
-    /* 'reserved' is kept so the exported ABI does not change. */
-    (void)reserved;
+    long long t_start = now_us ();
 
     if (!g)
         return 0;
@@ -963,8 +1237,13 @@ arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
             float ddx = q[2];
             float ddy = q[3];
             float th  = q[4];
-            double dd = sqrt ((double)ddx * ddx + (double)ddy * ddy)
-                      + 2.0 * (double)rad * fabs (sin (th * 0.5f));
+            float sc  = q[5] > 0.0f ? q[5] : 0.0f;
+            float tap = (g->spt && g->spt[i] > 0.0f) ? g->spt[i] : 0.0f;
+            double Rs = (double)rad * (1.0 + (double)tap * ARAP_TAPER_RANGE);
+            double s2 = sin ((double)th * 0.5);
+            double dm = (double)sc - 1.0;
+            double rot_sc = sqrt (dm * dm + 4.0 * (double)sc * s2 * s2);
+            double dd = sqrt ((double)ddx * ddx + (double)ddy * ddy) + Rs * rot_sc;
 
             if (dd > max_pin_disp)
                 max_pin_disp = dd;
@@ -1022,6 +1301,15 @@ arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
             it++;
             break;
         }
+
+        /* Anytime behaviour: while dragging, stop when the time is up. The
+           result is a valid (if not fully converged) mesh and the next call
+           warm-starts from it. */
+        if (budget_us > 0 && now_us () - t_start > budget_us)
+        {
+            it++;
+            break;
+        }
     }
 
     for (i = 0; i < g->nv; i++)
@@ -1066,6 +1354,22 @@ arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
     }
 
     return it;
+}
+
+/* 'reserved' is kept so the exported ABI does not change. */
+PW_EXPORT int
+arap_grid_solve (void *handle, int iters, int reserved, float tol, int warm)
+{
+    (void)reserved;
+    return arap_solve_impl (handle, iters, tol, warm, 0);
+}
+
+/* Same solve, but stops after at most budget_us microseconds (always at least
+   one iteration). budget_us <= 0 means no limit. */
+PW_EXPORT int
+arap_grid_solve_budget (void *handle, int iters, int budget_us, float tol, int warm)
+{
+    return arap_solve_impl (handle, iters, tol, warm, (long long)budget_us);
 }
 
 PW_EXPORT ArapVec2 *
@@ -1132,8 +1436,12 @@ arap_grid_free (void *handle)
 
     free (g->rx);
     free (g->ry);
-    free (g->xx);
-    free (g->yy);
+    free (g->xxb);
+    free (g->yyb);
+    free (g->F);
+    free (g->Bk);
+    free (g->invd);
+    free (g->tux);
 
     free (g->out);
     free (g);

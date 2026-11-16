@@ -65,7 +65,7 @@ from puppet_warp_resize import (
     apply_filter_to_drawable,
     remove_filter_from_drawable,
 )
-
+from puppet_warp_extras import PuppetWarpExtrasMixin
 
 
 class Pin:
@@ -102,7 +102,7 @@ def load_existing_params(drawable):
     return None
 
 
-class PuppetWarpDialog(Gtk.Dialog):
+class PuppetWarpDialog(Gtk.Dialog, PuppetWarpExtrasMixin):
     _dead = False
     extend_on = False
     _extend_supported = True
@@ -142,8 +142,17 @@ class PuppetWarpDialog(Gtk.Dialog):
         self.canvas_w = cw
         self.canvas_h = ch
 
-        self.cols = 15
-        self.rows = 15
+        # Square-ish default grid matching image aspect ratio
+        if cw > 0 and ch > 0:
+            if cw <= ch:
+                self.cols = 16
+                self.rows = max(16, min(48, int(round(16.0 * ch / cw))))
+            else:
+                self.rows = 16
+                self.cols = max(16, min(48, int(round(16.0 * cw / ch))))
+        else:
+            self.cols = 16
+            self.rows = 16
 
         self.puppet_x = 0.0
         self.puppet_y = 0.0
@@ -176,6 +185,10 @@ class PuppetWarpDialog(Gtk.Dialog):
         self._bg_pos = None
         self._bg_ox = 0
         self._bg_oy = 0
+        self._bg_mip = None
+        self._bg_ver = 0
+        self._src_mip = None
+        self._css_provider = None
 
         try:
             self._bg_layers = _as_list(self.image.get_layers())
@@ -195,6 +208,8 @@ class PuppetWarpDialog(Gtk.Dialog):
 
         self._cw_list_cache = {}
         self._cw_payload_cache = {}
+        self._cell_active_cache = {}
+        self._bounds_np_cache = None
 
         self.pins = []
         self.active_pin_index = None
@@ -216,7 +231,7 @@ class PuppetWarpDialog(Gtk.Dialog):
         self.mesh_color = (0.2, 0.9, 1.0)
 
         self.drag_offset = (0.0, 0.0)
-        self.puppet_radius = 400.0
+        self.puppet_radius = max(400.0, math.hypot(cw, ch))
 
         self.pan_x = 25.0
         self.pan_y = 25.0
@@ -226,6 +241,7 @@ class PuppetWarpDialog(Gtk.Dialog):
         self.pan_start = (0.0, 0.0)
 
         self._update_timer = None
+        self._draft_solve = False
         self._rz_timer = None
         self._motion_timer = None
         self._motion_pending = False
@@ -262,7 +278,9 @@ class PuppetWarpDialog(Gtk.Dialog):
         self._tick_ms = 40.0
         self._render_ms = 0.0
         self._idle_iters = 30
-        self._warm_solve = False 
+        self._drag_iters = int(os.environ.get("PW_DRAG_ITERS", "28"))
+        self._drag_tol = float(os.environ.get("PW_DRAG_TOL", "0.08"))
+        self._warm_solve = False
 
         self._verts_raw = None
         self._verts_raw_n = 0
@@ -292,6 +310,8 @@ class PuppetWarpDialog(Gtk.Dialog):
                 self.use_stiffness = bool(prev.get("use_stiffness", True))
 
                 bm = str(prev.get("bg_mode", "below")).strip().lower()
+                if bm == "full":
+                    bm = "composite"
                 if bm not in self._bg_keys:
                     bm = "below"
                 self.bg_mode = bm
@@ -363,8 +383,6 @@ class PuppetWarpDialog(Gtk.Dialog):
 
             self.restored_pins = len(self.pins)
 
-        self._refresh_bg_preview()
-        # Extend attrs safety, in case older __init__ survived.
         if not hasattr(self, "extend_on"):
             self.extend_on = False
         if not hasattr(self, "_extend_supported"):
@@ -388,8 +406,11 @@ class PuppetWarpDialog(Gtk.Dialog):
             if not hasattr(self, _attr):
                 setattr(self, _attr, _val)
 
-        self._heal_reopen_pad()
+        self._heal_reopen_pad(prev)
+        self._refresh_bg_preview()
+        self._init_extras(prev)
         self._build_ui()
+        self._sync_extras_ui()
         self._sync_pin_panel()
 
         self.connect("key-press-event", self._on_dialog_key)
@@ -406,16 +427,16 @@ class PuppetWarpDialog(Gtk.Dialog):
 
     def _on_dialog_key(self, w, e):
         kv = e.keyval
+        focus = self.get_focus()
 
-        # Let text entries and spin buttons (a subclass of Entry) keep their keys.
-        if isinstance(self.get_focus(), Gtk.Entry):
+        if isinstance(focus, Gtk.Entry):
             return False
 
         if kv == Gdk.KEY_Escape:
             if e.state & (Gdk.ModifierType.MOD1_MASK
                           | Gdk.ModifierType.CONTROL_MASK
                           | Gdk.ModifierType.SHIFT_MASK):
-                return False
+                return self._on_key_press(w, e)
             self.response(Gtk.ResponseType.CANCEL)
             return True
 
@@ -423,10 +444,41 @@ class PuppetWarpDialog(Gtk.Dialog):
             self.response(Gtk.ResponseType.OK)
             return True
 
-        return False
+        arrows = (
+            Gdk.KEY_Left,
+            Gdk.KEY_Right,
+            Gdk.KEY_Up,
+            Gdk.KEY_Down,
+            Gdk.KEY_KP_Left,
+            Gdk.KEY_KP_Right,
+            Gdk.KEY_KP_Up,
+            Gdk.KEY_KP_Down,
+        )
+        if kv in arrows and isinstance(focus, (Gtk.Scale, Gtk.ComboBox)):
+            return False
+
+        return self._on_key_press(w, e)
 
     def _on_destroy(self, w):
         self._dead = True
+        for _m in ("_src_mip", "_bg_mip", "_fg_mip"):
+            if hasattr(self, _m):
+                self._free_mip(_m)
+
+        self._vp_surface = None
+        self._dst_surface = None
+        self._dst_scaled = None
+        self._mesh_path_cache = None
+
+        prov = getattr(self, "_css_provider", None)
+        if prov is not None:
+            try:
+                screen = Gdk.Screen.get_default()
+                if screen is not None:
+                    Gtk.StyleContext.remove_provider_for_screen(screen, prov)
+            except Exception:
+                pass
+            self._css_provider = None
 
         for attr in ("_update_timer", "_rz_timer", "_motion_timer"):
             tid = getattr(self, attr, None)
@@ -469,18 +521,50 @@ class PuppetWarpDialog(Gtk.Dialog):
                     x0 = int(c * wd / cols)
                     x1 = max(x0 + 1, int((c + 1) * wd / cols))
 
-                    m = float(self._alpha[y0:y1, x0:x1].mean())
-                    w[r * cols + c] = m if m > 0.03 else 0.0
+                    blk = self._alpha[y0:y1, x0:x1]
+                    m = float(blk.mean())
+                    if m <= 0.02:
+                        w[r * cols + c] = 0.0
+                    else:
+                        w[r * cols + c] = max(0.25, min(1.0, m * 2.5))
 
+        if len(self._cw_list_cache) >= 4:
+            self._cw_list_cache.clear()
         self._cw_list_cache[key] = w
         return w
+
+    def cell_active_payload(self, cols, rows):
+        key = (cols, rows)
+        hit = self._cell_active_cache.get(key)
+        if hit is not None:
+            return hit
+
+        n = cols * rows
+        if self._alpha is not None:
+            h, wd = self._alpha.shape
+            flags = [0] * n
+            for r in range(rows):
+                y0 = max(0, int(r * h / rows) - 1)
+                y1 = min(h, max(y0 + 1, int((r + 1) * h / rows) + 1))
+                for c in range(cols):
+                    x0 = max(0, int(c * wd / cols) - 1)
+                    x1 = min(wd, max(x0 + 1, int((c + 1) * wd / cols) + 1))
+                    if float(self._alpha[y0:y1, x0:x1].max()) > 0.0:
+                        flags[r * cols + c] = 1
+            arr = (ctypes.c_uint8 * n)(*flags)
+        else:
+            arr = (ctypes.c_uint8 * n)(*([1] * n))
+
+        if len(self._cell_active_cache) >= 4:
+            self._cell_active_cache.clear()
+        self._cell_active_cache[key] = arr
+        return arr
 
     def _build_ui(self):
         ca = self.get_content_area()
         ca.set_spacing(2)
         ca.set_border_width(3)
 
-        # Compact styling, scoped by a class so it does not touch all GIMP UI.
         try:
             self.get_style_context().add_class("pw-compact")
 
@@ -569,7 +653,6 @@ class PuppetWarpDialog(Gtk.Dialog):
 
             return sp
 
-        # Row 1: grid + quick actions + pin counter.
         row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
 
         row1.pack_start(Gtk.Label(label="Grid"), False, False, 0)
@@ -613,7 +696,6 @@ class PuppetWarpDialog(Gtk.Dialog):
 
         ca.pack_start(row1, False, False, 0)
 
-        # Row 2: mesh display + options popover.
         row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
 
         row2.pack_start(Gtk.Label(label="Mesh"), False, False, 0)
@@ -647,7 +729,7 @@ class PuppetWarpDialog(Gtk.Dialog):
 
         options_btn = Gtk.MenuButton()
         options_btn.set_label("Options")
-        options_btn.set_tooltip_text("Solver, preview background, presets, extend.")
+        options_btn.set_tooltip_text("Solver, presets, and extend settings.")
 
         options_pop = Gtk.Popover.new(options_btn)
         options_pop.set_position(Gtk.PositionType.BOTTOM)
@@ -710,22 +792,6 @@ class PuppetWarpDialog(Gtk.Dialog):
             2,
         )
 
-        bg_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
-        bg_row.pack_start(Gtk.Label(label="BG"), False, False, 0)
-
-        self.bg_combo = Gtk.ComboBoxText()
-        for _lab in ("Off", "Below", "Composite"):
-            self.bg_combo.append_text(_lab)
-        self.bg_combo.set_active(self._bg_index())
-        self.bg_combo.set_size_request(92, -1)
-        self.bg_combo.set_tooltip_text(
-            "Preview background: Below = first visible layer below, "
-            "Composite = stack visible layers below, Off = none."
-        )
-        self._bg_id = self.bg_combo.connect("changed", self._on_bg_mode_changed)
-        bg_row.pack_start(self.bg_combo, False, False, 0)
-        options_box.pack_start(bg_row, False, False, 0)
-
         preset_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         preset_row.pack_start(Gtk.Label(label="Presets"), False, False, 0)
 
@@ -750,8 +816,8 @@ class PuppetWarpDialog(Gtk.Dialog):
         row2.pack_start(options_btn, False, False, 0)
 
         ca.pack_start(row2, False, False, 0)
+        self._build_extras_ui(ca, row2, options_box, sep, small_spin)
 
-        # Row 3: selected pin inspector, hidden until a pin is active.
         row3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         self.pin_row = row3
 
@@ -817,7 +883,6 @@ class PuppetWarpDialog(Gtk.Dialog):
 
         ca.pack_start(row3, False, False, 0)
 
-        # Show children once, then keep the row itself hidden by default.
         row3.show_all()
 
         self.drawing_area = Gtk.DrawingArea()
@@ -837,18 +902,16 @@ class PuppetWarpDialog(Gtk.Dialog):
         self.drawing_area.connect("motion-notify-event", self._on_motion)
         self.drawing_area.connect("scroll-event", self._on_scroll)
         self.drawing_area.connect("leave-notify-event", self._on_leave)
-        self.drawing_area.connect("key-press-event", self._on_key_press)
 
         fr = Gtk.Frame()
         fr.set_shadow_type(Gtk.ShadowType.IN)
         fr.add(self.drawing_area)
         ca.pack_start(fr, True, True, 0)
 
-        self.status_label = Gtk.Label(label="""Click add · drag move · Shift axis · right/Alt delete · double-click reset.
+        self.status_label = Gtk.Label(label="""Click add · drag move · Shift axis · right/Alt delete · double-click reset · \\ Before/After · Ctrl+; Guides.
 Ring: dot rotate, body scale · Ctrl pivot · wheel: Alt rot, Ctrl scale, Shift taper.
 Shift click multi · Ctrl+A all · Del remove · arrows nudge · Alt+Esc clear · Enter apply · Esc cancel.
-Options > Extend image grows the layer (and its mask) when needed.
-Pin depth: select pin, [ back / ] front (overlap order).""")
+Options > Extend image grows the layer (and its mask) when needed · Pin depth: [ back / ] front.""")
 
         self.status_label.set_line_wrap(True)
         self.status_label.set_max_width_chars(112)
@@ -877,9 +940,22 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         arr = (ctypes.c_float * len(cw))(*cw)
 
         hit = (arr, len(cw), sig)
+        if len(self._cw_payload_cache) >= 4:
+            self._cw_payload_cache.clear()
         self._cw_payload_cache[sig] = hit
 
         return hit
+
+    def _get_deformed_verts(self):
+        n_expect = (self.cols + 1) * (self.rows + 1)
+        if self.deformed_verts is not None and len(self.deformed_verts) == n_expect:
+            return self.deformed_verts
+        if HAS_NUMPY and self._verts_raw_np is not None and self._verts_raw_n == n_expect:
+            vv = self._verts_raw_np.tolist()
+            self.deformed_verts = vv
+            self._last_good_verts = vv
+            return vv
+        return self._last_good_verts
 
     def get_params_json(self):
         pins_flat = []
@@ -893,9 +969,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         verts_flat = []
         n_expect = (self.cols + 1) * (self.rows + 1)
+        verts = self._get_deformed_verts()
 
-        if self.deformed_verts and len(self.deformed_verts) == n_expect:
-            for vx, vy in self.deformed_verts:
+        if verts and len(verts) == n_expect:
+            for vx, vy in verts:
                 verts_flat.extend([round(vx, 4), round(vy, 4)])
 
         params = {
@@ -910,6 +987,16 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             "pad_right": int(getattr(self, "pad_right", 0)),
             "pad_bottom": int(getattr(self, "pad_bottom", 0)),
             "bg_mode": str(self.bg_mode),
+            "fg_mode": str(getattr(self, "fg_mode", "off")),
+            "fg_on": bool(getattr(self, "fg_mode", "off") != "off"),
+            "guides_on": bool(getattr(self, "guides_on", True)),
+            "align_grid_on": bool(getattr(self, "align_grid_on", False)),
+            "align_grid_step": int(getattr(self, "align_grid_step", 50)),
+            "snap_on": bool(getattr(self, "snap_on", False)),
+            "guides_local": [
+                [g[0], round(float(g[1]), 2)]
+                for g in getattr(self, "_local_guides", [])
+            ],
             "mesh_style": str(self.mesh_style),
             "mesh_color": [
                 round(float(self.mesh_color[0]), 4),
@@ -938,8 +1025,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         return [(p.sx, p.sy, p.dx, p.dy, p.theta, p.scale, p.taper, p.depth, p.qx, p.qy)
                 for p in self.pins]
 
-    def _push_undo(self):
-        self._undo_stack.append(self._snap())
+    def _push_undo(self, state=None):
+        entry = state if state is not None else self._snapshot_capture()
+        self._undo_stack.append(entry)
         if len(self._undo_stack) > 64:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
@@ -955,7 +1043,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             p.scale = t[5] if len(t) > 5 else 1.0
             p.taper = t[6] if len(t) > 6 else 0.0
             p.depth = t[7] if len(t) > 7 else 0
-            p.qx = t[8] if len(t) > 9 else p.dx
+            p.qx = t[8] if len(t) > 8 else p.dx
             p.qy = t[9] if len(t) > 9 else p.dy
             self.pins.append(p)
 
@@ -969,7 +1057,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.selected = set()
         self.multi_orig = None
         self.multi_anchor = None
-        
+
         self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
@@ -979,14 +1067,22 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
     def _do_undo(self):
         if self._undo_stack:
-            self._redo_stack.append(self._snap())
-            self._restore_snapshot(self._undo_stack.pop())
+            self._redo_stack.append(self._snapshot_capture())
+            item = self._undo_stack.pop()
+            if isinstance(item, dict):
+                self._snapshot_apply_state(item, push_undo=False)
+            else:
+                self._restore_snapshot(item)
         return True
 
     def _do_redo(self):
         if self._redo_stack:
-            self._undo_stack.append(self._snap())
-            self._restore_snapshot(self._redo_stack.pop())
+            self._undo_stack.append(self._snapshot_capture())
+            item = self._redo_stack.pop()
+            if isinstance(item, dict):
+                self._snapshot_apply_state(item, push_undo=False)
+            else:
+                self._restore_snapshot(item)
         return True
 
     def _on_key_press(self, w, e):
@@ -995,6 +1091,20 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         alt = bool(st & Gdk.ModifierType.MOD1_MASK)
         shift = bool(st & Gdk.ModifierType.SHIFT_MASK)
         kv = e.keyval
+
+        if kv == Gdk.KEY_backslash and not ctrl and not alt:
+            if hasattr(self, "compare_orig_btn"):
+                self.compare_orig_btn.set_active(not self.compare_orig_btn.get_active())
+                return True
+
+        if kv == Gdk.KEY_grave and not ctrl and not alt:
+            if hasattr(self, "_on_compare_cycle"):
+                return self._on_compare_cycle()
+        
+        if kv == Gdk.KEY_semicolon and ctrl:
+            if hasattr(self, "guides_btn"):
+                self.guides_btn.set_active(not self.guides_btn.get_active())
+                return True
 
         if kv == Gdk.KEY_Escape:
             if alt and self.selected:
@@ -1097,8 +1207,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         return i if (sx - px) ** 2 + (sy - py) ** 2 <= rad * rad else None
 
     def _ring_hit(self, sx, sy):
-        """Active pin index if cursor is on the ring body (not the dot/pin).
-        Ring radius on screen is constant 28 px (world 28/zoom * zoom)."""
         i = self.active_pin_index
         if i is None or not (0 <= i < len(self.pins)):
             return None
@@ -1110,6 +1218,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         return None
 
     def _reset_warp(self):
+        self._exit_compare_modes(keep_shown=False)
         self._push_undo()
 
         for p in self.pins:
@@ -1178,7 +1287,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 if py is not None:
                     py.set_value(p.qy)
             else:
-                # Neutral values when no pin is selected.
                 if rot is not None:
                     rot.set_value(0.0)
                 if scale is not None:
@@ -1335,7 +1443,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self.active_pin_index = None
 
         self.selected = set()
-        
+
         self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
@@ -1357,6 +1465,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             p.qx += dx
             p.qy += dy
 
+        self._panel_sync_t = time.monotonic()
+        self._sync_pin_panel()
         self._schedule_update()
         self.drawing_area.queue_draw()
 
@@ -1375,6 +1485,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self._bg_alpha = 1.0
         self._bg_bounds = None
 
+        if hasattr(self, "_free_mip"):
+            self._free_mip("_bg_mip")
+        self._bg_ver = getattr(self, "_bg_ver", 0) + 1
+
         keys = getattr(self, "_bg_keys", ("off", "below", "composite"))
         mode = getattr(self, "bg_mode", "below")
         if mode not in keys:
@@ -1382,6 +1496,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self.bg_mode = mode
 
         if os.environ.get("PW_NO_BG") == "1" or mode == "off":
+            da = getattr(self, "drawing_area", None)
+            if da is not None:
+                da.queue_draw()
             return
 
         layers = getattr(self, "_bg_layers", None)
@@ -1396,6 +1513,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self._build_bg_composite(layers, pos, ox, oy)
         else:
             self._build_bg_below(layers, pos, ox, oy)
+
+        if self._bg_surface is not None and hasattr(self, "_build_mip_for_surface"):
+            self._bg_mip = self._build_mip_for_surface(self._bg_surface)
 
         da = getattr(self, "drawing_area", None)
         if da is not None:
@@ -1504,8 +1624,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
             ctx = cairo.Context(surf)
 
-            # layers list is topmost-first, so draw from bottom to top.
             for l, x, y, lw, lh, op in reversed(items):
+                ls = None
                 try:
                     raw = bytes(
                         l.get_buffer().get(
@@ -1528,6 +1648,12 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
                 except Exception:
                     continue
+                finally:
+                    if ls is not None:
+                        try:
+                            ls.finish()
+                        except Exception:
+                            pass
 
             surf.flush()
 
@@ -1542,6 +1668,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self._bg_surface = None
 
     def _on_bg_mode_changed(self, combo):
+        if getattr(self, "_updating_extras", False):
+            return
+
         keys = getattr(self, "_bg_keys", ("off", "below", "composite"))
         idx = combo.get_active()
 
@@ -1607,6 +1736,16 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 "extend": bool(self.extend_on),
                 "use_stiffness": bool(self.use_stiffness),
                 "bg_mode": str(self.bg_mode),
+                "fg_mode": str(getattr(self, "fg_mode", "off")),
+                "fg_on": bool(getattr(self, "fg_mode", "off") != "off"),
+                "guides_on": bool(getattr(self, "guides_on", True)),
+                "align_grid_on": bool(getattr(self, "align_grid_on", False)),
+                "align_grid_step": int(getattr(self, "align_grid_step", 50)),
+                "snap_on": bool(getattr(self, "snap_on", False)),
+                "guides_local": [
+                    [g[0], round(float(g[1]), 2)]
+                    for g in getattr(self, "_local_guides", [])
+                ],
                 "mesh_style": str(self.mesh_style),
                 "mesh_color": [
                     round(float(self.mesh_color[0]), 4),
@@ -1727,6 +1866,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         if not isinstance(pkg, dict):
             return False
 
+        self._exit_compare_modes(keep_shown=False)
         self._push_undo()
 
         keys = getattr(self, "_bg_keys", ("off", "below", "composite"))
@@ -1794,15 +1934,40 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         )
 
         bm = str(pkg.get("bg_mode", self.bg_mode)).strip().lower()
+        was_full = (bm == "full")
+        if was_full:
+            bm = "composite"
         if bm not in keys:
             bm = "below"
         self.bg_mode = bm
-        self._set_blocked(
-            getattr(self, "bg_combo", None),
-            getattr(self, "_bg_id", None),
-            lambda v: self.bg_combo.set_active(v),
-            keys.index(bm),
-        )
+
+        fm = str(pkg.get("fg_mode", "")).strip().lower()
+        if fm not in getattr(self, "_fg_keys", ("off", "above", "composite")):
+            fm = "composite" if (was_full or pkg.get("fg_on", False)) else "off"
+        self.fg_mode = fm
+
+        self.guides_on = bool(pkg.get("guides_on", self.guides_on))
+        self.align_grid_on = bool(pkg.get("align_grid_on", self.align_grid_on))
+        try:
+            self.align_grid_step = max(
+                4, min(512, int(pkg.get("align_grid_step", self.align_grid_step)))
+            )
+        except Exception:
+            pass
+        self.snap_on = bool(pkg.get("snap_on", self.snap_on))
+        if isinstance(pkg.get("guides_local"), list):
+            gl = []
+            for item in pkg.get("guides_local"):
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    ori = str(item[0]).upper()
+                    if ori in ("H", "V"):
+                        try:
+                            pos = float(item[1])
+                            if math.isfinite(pos):
+                                gl.append([ori, pos])
+                        except Exception:
+                            pass
+            self._local_guides = gl
 
         ms = str(pkg.get("mesh_style", self.mesh_style)).strip().lower()
         if ms in mesh_keys:
@@ -1918,7 +2083,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.is_moving_pivot = False
         self._drag_pushed = False
 
+        self._sync_extras_ui()
         self._refresh_bg_preview()
+        self._refresh_fg_preview()
         self._warm_solve = False
         self._solve_preview()
         self._last_solve_sig = self._solve_sig()
@@ -1957,7 +2124,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             elif nd < -999:
                 nd = -999
             p.depth = nd
-        # depth is render-layer z-order, not a solver input: no re-solve.
         self.drawing_area.queue_draw()
         self._sync_pin_panel()
 
@@ -2015,8 +2181,45 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.pins[i].depth = nd
         self.drawing_area.queue_draw()
 
+    def _bounds_now(self):
+        """Fast bounds directly from numpy C-buffer view; zero Python list conversion."""
+        if (
+            HAS_NUMPY
+            and self._verts_raw_np is not None
+            and self._verts_raw_seq == self._solve_seq
+        ):
+            cache = getattr(self, "_bounds_np_cache", None)
+            if cache is not None and cache[0] == self._solve_seq:
+                return cache[1]
+
+            arr = self._verts_raw_np
+            res = None
+            if arr.size:
+                x0 = float(arr[:, 0].min())
+                y0 = float(arr[:, 1].min())
+                x1 = float(arr[:, 0].max())
+                y1 = float(arr[:, 1].max())
+                if (
+                    math.isfinite(x0) and math.isfinite(y0)
+                    and math.isfinite(x1) and math.isfinite(y1)
+                ):
+                    res = (x0, y0, x1, y1)
+                else:
+                    fin = arr[np.isfinite(arr).all(axis=1)]
+                    if fin.size:
+                        res = (
+                            float(fin[:, 0].min()),
+                            float(fin[:, 1].min()),
+                            float(fin[:, 0].max()),
+                            float(fin[:, 1].max()),
+                        )
+
+            self._bounds_np_cache = (self._solve_seq, res)
+            return res
+
+        return self._bounds_of(self.deformed_verts)
+
     def _bounds_of(self, verts):
-        """(minx, miny, maxx, maxy) over finite vertices; cached per solved list."""
         if not verts:
             return None
 
@@ -2027,11 +2230,22 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         res = None
         try:
             if HAS_NUMPY:
-                arr = np.asarray(verts, dtype=np.float64).reshape(-1, 2)
-                arr = arr[np.isfinite(arr).all(axis=1)]
+                arr = np.asarray(verts, dtype=np.float32).reshape(-1, 2)
                 if arr.size:
-                    res = (float(arr[:, 0].min()), float(arr[:, 1].min()),
-                           float(arr[:, 0].max()), float(arr[:, 1].max()))
+                    x0 = float(arr[:, 0].min())
+                    y0 = float(arr[:, 1].min())
+                    x1 = float(arr[:, 0].max())
+                    y1 = float(arr[:, 1].max())
+                    if (
+                        math.isfinite(x0) and math.isfinite(y0)
+                        and math.isfinite(x1) and math.isfinite(y1)
+                    ):
+                        res = (x0, y0, x1, y1)
+                    else:
+                        arr = arr[np.isfinite(arr).all(axis=1)]
+                        if arr.size:
+                            res = (float(arr[:, 0].min()), float(arr[:, 1].min()),
+                                   float(arr[:, 0].max()), float(arr[:, 1].max()))
             else:
                 pts = [(float(x), float(y)) for x, y in verts]
                 pts = [(x, y) for x, y in pts if math.isfinite(x) and math.isfinite(y)]
@@ -2045,12 +2259,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self._bounds_cache = (verts, res)
         return res
 
-    def _pad_from_verts(self, verts):
-        if not getattr(self, "extend_on", False) or not verts:
-            return (0, 0, 0, 0)
-
-        b = self._bounds_of(verts)
-        if b is None:
+    def _pad_from_bounds(self, b):
+        if not getattr(self, "extend_on", False) or b is None:
             return (0, 0, 0, 0)
 
         minx, miny, maxx, maxy = b
@@ -2083,14 +2293,20 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self.preview_pad_bottom = getattr(self, "_open_pad_bottom", 0)
             return
 
-        pl, pt, pr, pb = self._pad_from_verts(getattr(self, "deformed_verts", None))
+        if not getattr(self, "extend_on", False):
+            self.preview_pad_left = 0
+            self.preview_pad_top = 0
+            self.preview_pad_right = 0
+            self.preview_pad_bottom = 0
+            return
+
+        pl, pt, pr, pb = self._pad_from_bounds(self._bounds_now())
         self.preview_pad_left = pl
         self.preview_pad_top = pt
         self.preview_pad_right = pr
         self.preview_pad_bottom = pb
 
     def finalize_extend_pad(self):
-        # Mask-aware now: pad is computed even on masked layers.
         if not getattr(self, "_extend_supported", True):
             self.pad_left = getattr(self, "_open_pad_left", 0)
             self.pad_top = getattr(self, "_open_pad_top", 0)
@@ -2099,7 +2315,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self._update_preview_pad()
             return
 
-        pl, pt, pr, pb = self._pad_from_verts(getattr(self, "deformed_verts", None))
+        pl, pt, pr, pb = self._pad_from_bounds(self._bounds_now())
         self.pad_left = pl
         self.pad_top = pt
         self.pad_right = pr
@@ -2135,7 +2351,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             cur_w = self.canvas_w + old[0] + old[2]
             cur_h = self.canvas_h + old[1] + old[3]
 
-        # Original content sits at old pad inside the current layer.
         content_x = ox + old[0]
         content_y = oy + old[1]
 
@@ -2144,8 +2359,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         nox = content_x - new[0]
         noy = content_y - new[1]
 
-        # Resize anchor = where the OLD layer's (0,0) lands in the NEW layer.
-        # Old (0,0) is old_pad px left of the content; content must land at new_pad.
         ax = new[0] - old[0]
         ay = new[1] - old[1]
 
@@ -2161,10 +2374,16 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             "anchor_y": int(ay),
         }
 
-    def _heal_reopen_pad(self):
-        # Independent re-detect, run after __init__ may have mis-read pad.
-        # Override everything coordinate-related so a wrong __init__ cannot
-        # leak a padded buffer into the mesh as if it were the base layer.
+    def build_snapshot_export_data(self, st):
+        self._snapshot_apply_state(st, push_undo=False)
+        self.finalize_extend_pad()
+        return (
+            self.get_params_json(),
+            self.get_resize_plan(),
+            len(self.pins),
+        )
+    
+    def _heal_reopen_pad(self, prev=None):
         draw_w = self.drawable.get_width()
         draw_h = self.drawable.get_height()
         try:
@@ -2172,13 +2391,11 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         except Exception:
             dox = doy = 0
 
-        prev = load_existing_params(self.drawable)
+        if prev is None:
+            prev = load_existing_params(self.drawable)
         dbg = bool(os.environ.get("PW_DEBUG"))
 
         if prev is None:
-            if dbg:
-                print("[pw-reopen] prev=None: cannot read filter params "
-                      "(layer heals as unpadded)")
             return
 
         try:
@@ -2190,34 +2407,21 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             pb = max(0, int(prev.get("pad_bottom", 0) or 0))
             ext_flag = bool(prev.get("extend", False))
         except Exception:
-            if dbg:
-                print("[pw-reopen] parse pad fail")
             return
 
         if ow <= 0 or oh <= 0:
-            if dbg:
-                print("[pw-reopen] orig missing in params (ow=%d oh=%d)" % (ow, oh))
             return
 
-        # Flexible: only require the crop rect to fit the buffer.
         if not (ow <= draw_w and oh <= draw_h and pl + ow <= draw_w and pt + oh <= draw_h):
-            if dbg:
-                print("[pw-reopen] WARN crop not fit: draw=%dx%d ow=%d oh=%d pad=(%d,%d,%d,%d)"
-                      % (draw_w, draw_h, ow, oh, pl, pt, pr, pb))
             return
 
         pr = min(pr, max(0, draw_w - pl - ow))
         pb = min(pb, max(0, draw_h - pt - oh))
 
-        # Already correct? nothing to heal.
         if (self.canvas_w == ow and self.canvas_h == oh and self.pad_left == pl
                 and self.pad_top == pt and self.pad_right == pr and self.pad_bottom == pb):
-            if dbg:
-                print("[pw-reopen] ok (no heal needed) canvas=%dx%d pad=(%d,%d,%d,%d) extend=%d"
-                      % (ow, oh, pl, pt, pr, pb, int(self.extend_on)))
             return
 
-        # Override geometry.
         self.canvas_w = ow
         self.canvas_h = oh
         self.pad_left = pl
@@ -2228,9 +2432,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.puppet_y = 0.0
         self.puppet_w = float(ow)
         self.puppet_h = float(oh)
+        self.puppet_radius = max(400.0, math.hypot(ow, oh))
         self.extend_on = bool(ext_flag or pl or pt or pr or pb)
 
-        # Re-read only the original pixels out of the padded buffer.
         rect = Gegl.Rectangle.new(pl, pt, ow, oh)
         raw = bytes(
             self.drawable.get_buffer().get(
@@ -2252,12 +2456,11 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             except Exception:
                 self._alpha = None
 
-        # alpha/size changed -> stiffness + raster caches are stale.
         self._cw_list_cache = {}
         self._cw_payload_cache = {}
+        self._cell_active_cache = {}
         self._raster_key = None
 
-        # Background must align to the original content, not the padded corner.
         self._bg_ox = dox + pl
         self._bg_oy = doy + pt
         self._open_pad_left = pl
@@ -2268,8 +2471,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.preview_pad_top = pt
         self.preview_pad_right = pr
         self.preview_pad_bottom = pb
-
-        self._refresh_bg_preview()
 
         if dbg:
             print("[pw-reopen] HEALED draw=%dx%d -> canvas=%dx%d pad=(%d,%d,%d,%d) extend=%d"
@@ -2321,12 +2522,11 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         return min(1.0, max(0.25, self._raster_zoom_now()))
 
     def _raster_geometry(self):
-        """World rect + scale cho cached raster. Pan-invariant khi extend on."""
         if not bool(getattr(self, "extend_on", False)):
             return (0.0, 0.0, float(self.canvas_w), float(self.canvas_h),
                     self._preview_scale())
 
-        b = self._bounds_of(getattr(self, "deformed_verts", None))
+        b = self._bounds_now()
         if b is None:
             return (0.0, 0.0, float(self.canvas_w), float(self.canvas_h),
                     self._preview_scale())
@@ -2341,13 +2541,12 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         area = max(1.0, (cx1 - cx0) * (cy1 - cy0))
         scale = self._preview_scale()
 
-        # Cap raster ở ~4 M px để không cháy RAM/bandwidth trên ảnh lớn
         MAX_PX = 4_000_000
         if area * scale * scale > MAX_PX:
             scale = max(0.1, (MAX_PX / area) ** 0.5)
 
         return (cx0, cy0, cx1, cy1, scale)
-    
+
     def _view_rect(self):
         a = self.drawing_area.get_allocation()
         dw = a.width if a.width > 50 else 800
@@ -2361,9 +2560,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         vx1 = vx0 + dw / z + 2.0 * m
         vy1 = vy0 + dh / z + 2.0 * m
 
-        # extend: allow the view to cover warped pixels outside bounds
         if bool(getattr(self, "extend_on", False)):
-            b = self._bounds_of(getattr(self, "deformed_verts", None))
+            b = self._bounds_now()
             if b is not None:
                 minx, miny, maxx, maxy = b
                 pad = 2.0
@@ -2381,7 +2579,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         if (self.is_dragging_pin or self.is_rotating
                 or self.is_scaling or self.is_moving_pivot):
-            s *= 0.5
+            area = max(1.0, (vx1 - vx0) * (vy1 - vy0))
+            MAX_DRAG_PX = 2_000_000
+            if area * s * s > MAX_DRAG_PX:
+                s = max(0.25, (MAX_DRAG_PX / area) ** 0.5)
 
         return (vx0, vy0, vx1, vy1, s)
 
@@ -2425,7 +2626,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self._last_solve_sig = self._solve_sig()
         self.drawing_area.queue_draw()
 
-    def _solve_preview(self, iters=None):
+    def _solve_preview(self, iters=None, tol=0.05, draft=False):
+        self._draft_solve = draft
         lib = _load_arap_lib()
         if lib is None:
             self.deformed_verts = None
@@ -2436,11 +2638,12 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         can_reuse = hasattr(lib, "arap_grid_reset_pins")
         grid = None
+        _tm = time.perf_counter
+        _t0 = _tm()
+        _t1 = _t2 = _t3 = _t0
 
         try:
             cw_arr, ncw, cw_sig = self._cw_payload()
-            # Rest-pose geometry is part of the signature: a cached grid built
-            # for a different puppet rectangle would silently keep old rest pins.
             grid_sig = (
                 self.cols, self.rows,
                 float(self.puppet_x), float(self.puppet_y),
@@ -2513,42 +2716,53 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 if has_taper:
                     lib.arap_grid_add_pin_taper(
                         grid,
-                        ctypes.c_float(p.sx),
-                        ctypes.c_float(p.sy),
-                        ctypes.c_float(p.dx - p.sx),
-                        ctypes.c_float(p.dy - p.sy),
-                        ctypes.c_float(th),
-                        ctypes.c_float(sc),
-                        ctypes.c_float(tp),
+                        float(p.sx),
+                        float(p.sy),
+                        float(p.dx - p.sx),
+                        float(p.dy - p.sy),
+                        float(th),
+                        float(sc),
+                        float(tp),
                     )
                 elif self.rotate_on and (p.theta != 0.0 or p.scale != 1.0) \
                         and hasattr(lib, "arap_grid_add_pin_sim"):
                     lib.arap_grid_add_pin_sim(
                         grid,
-                        ctypes.c_float(p.sx),
-                        ctypes.c_float(p.sy),
-                        ctypes.c_float(p.dx - p.sx),
-                        ctypes.c_float(p.dy - p.sy),
-                        ctypes.c_float(p.theta),
-                        ctypes.c_float(p.scale),
+                        float(p.sx),
+                        float(p.sy),
+                        float(p.dx - p.sx),
+                        float(p.dy - p.sy),
+                        float(p.theta),
+                        float(p.scale),
                     )
                 else:
                     lib.arap_grid_add_pin(
                         grid,
-                        ctypes.c_float(p.sx),
-                        ctypes.c_float(p.sy),
-                        ctypes.c_float(p.dx - p.sx),
-                        ctypes.c_float(p.dy - p.sy),
+                        float(p.sx),
+                        float(p.sy),
+                        float(p.dx - p.sx),
+                        float(p.dy - p.sy),
                     )
 
-            lib.arap_grid_solve(
-                grid,
-                ctypes.c_int(iters),
-                150,
-                ctypes.c_float(0.05),
-                ctypes.c_int(1 if self._warm_solve else 0),
-            )
+            _t1 = _tm()
+            if draft and hasattr(lib, "arap_grid_solve_budget"):
+                lib.arap_grid_solve_budget(
+                    grid,
+                    int(iters),
+                    12000,
+                    float(tol),
+                    1 if self._warm_solve else 0,
+                )
+            else:
+                lib.arap_grid_solve(
+                    grid,
+                    int(iters),
+                    150,
+                    float(tol),
+                    1 if self._warm_solve else 0,
+                )
 
+            _t2 = _tm()
             n = ctypes.c_int(0)
             verts_ptr = lib.arap_grid_verts(grid, ctypes.byref(n))
 
@@ -2574,19 +2788,18 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
                 self._solve_seq += 1
                 self._verts_raw_seq = self._solve_seq
+                self._bounds_np_cache = None
 
                 if HAS_NUMPY:
-                    vv = self._verts_raw_np.tolist()
+                    self.deformed_verts = None
                 else:
                     vv = [
                         (self._verts_raw[2 * i], self._verts_raw[2 * i + 1])
                         for i in range(n_val)
                     ]
-
-                self.deformed_verts = vv
-
-                if len(vv) == (self.cols + 1) * (self.rows + 1):
-                    self._last_good_verts = vv
+                    self.deformed_verts = vv
+                    if len(vv) == (self.cols + 1) * (self.rows + 1):
+                        self._last_good_verts = vv
             else:
                 self.deformed_verts = None
                 self._verts_raw = None
@@ -2594,8 +2807,13 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 self._verts_raw_np = None
                 self._verts_raw_seq = -1
 
-            # preview pad follows the solved mesh
+            _t3 = _tm()
             self._update_preview_pad()
+            if os.environ.get("PW_DEBUG"):
+                _t4 = _tm()
+                print("[pw-py] setup+pins=%.2f c_solve=%.2f verts=%.2f pad=%.2f ms"
+                      % ((_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3,
+                         (_t3 - _t2) * 1e3, (_t4 - _t3) * 1e3))
 
         except Exception:
             traceback.print_exc()
@@ -2652,7 +2870,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         try:
             self._warm_solve = True
-            self._solve_preview(self._idle_iters)
+            self._solve_preview(self._drag_iters, self._drag_tol, draft=True)
 
             dt = (time.monotonic() - t0) * 1000.0
             loop_ms = dt + getattr(self, "_render_ms", 0.0)
@@ -2671,7 +2889,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 )
 
             self.drawing_area.queue_draw()
-            self._sync_pin_panel()
+            now = time.monotonic()
+            if now - getattr(self, "_panel_sync_t", 0.0) > 0.2:
+                self._panel_sync_t = now
+                self._sync_pin_panel()
 
         except Exception:
             traceback.print_exc()
@@ -2744,8 +2965,22 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             return True
 
         if e.button == 3:
+            gh = self._guide_handle_hit(e.x, e.y)
+            if gh is None and (e.state & Gdk.ModifierType.CONTROL_MASK) and (e.state & Gdk.ModifierType.MOD1_MASK):
+                gh = self._guide_line_hit(e.x, e.y)
+            if gh is not None:
+                del self._local_guides[gh]
+                self._hovered_guide = None
+                self.drawing_area.queue_draw()
+                return True
+
+            if getattr(self, "_compare_orig_on", False):
+                self._exit_compare_modes(keep_shown=False)
+                return True
+
             h = self._find_pin_at(e.x, e.y)
             if h is not None:
+                self._exit_compare_modes(keep_shown=True)
                 self._delete_pin_at(h)
             return True
 
@@ -2754,13 +2989,35 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         shift = bool(e.state & Gdk.ModifierType.SHIFT_MASK)
         wx, wy = self._screen_to_world(e.x, e.y)
 
+        if e.button == 1:
+            gh = self._guide_handle_hit(e.x, e.y)
+            if gh is None and ctrl and alt:
+                gh = self._guide_line_hit(e.x, e.y)
+            if gh is not None:
+                self._dragging_guide = gh
+                self.drawing_area.queue_draw()
+                return True
+
+            if getattr(self, "_compare_orig_on", False):
+                self._exit_compare_modes(keep_shown=False)
+                return True
+            if getattr(self, "_compare_ab_on", False):
+                self._exit_compare_modes(keep_shown=True)
+
         if e.button == 1 and e.type == Gdk.EventType.DOUBLE_BUTTON_PRESS:
+            self.is_rotating = False
+            self.is_scaling = False
+            self.is_moving_pivot = False
+            self.is_dragging_pin = False
+            self._drag_pushed = False
+
             hh = self._find_handle_at(e.x, e.y)
             if hh is not None:
-                self._push_undo()
                 p = self.pins[hh]
-                p.theta = 0.0
-                p.scale = 1.0
+                if p.theta != 0.0 or p.scale != 1.0:
+                    self._push_undo()
+                    p.theta = 0.0
+                    p.scale = 1.0
                 self.active_pin_index = hh
                 self.selected = {hh}
                 self._solve_preview()
@@ -2772,14 +3029,14 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             h = self._find_pin_at(e.x, e.y)
             if h is not None:
                 p = self.pins[h]
-                self._push_undo()
-                p.dx, p.dy = p.sx, p.sy
-                p.theta = 0.0
-                p.scale = 1.0
-                p.qx, p.qy = p.sx, p.sy
+                if p.dx != p.sx or p.dy != p.sy or p.theta != 0.0 or p.scale != 1.0 or p.qx != p.sx or p.qy != p.sy:
+                    self._push_undo()
+                    p.dx, p.dy = p.sx, p.sy
+                    p.theta = 0.0
+                    p.scale = 1.0
+                    p.qx, p.qy = p.sx, p.sy
                 self.active_pin_index = h
                 self.selected = {h}
-                self.is_dragging_pin = False
                 self._solve_preview()
                 self._last_solve_sig = self._solve_sig()
                 self._sync_pin_panel()
@@ -2795,9 +3052,14 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 and self.active_pin_index is not None
                 and 0 <= self.active_pin_index < len(self.pins)
             ):
-                self._push_undo()
                 p = self.pins[self.active_pin_index]
-                p.qx, p.qy = wx, wy
+                wx_s, wy_s = self._snap_world(wx, wy)
+                if wx_s != p.qx or wy_s != p.qy:
+                    self._push_undo()
+                    p.qx, p.qy = wx_s, wy_s
+                    self._drag_pushed = True
+                else:
+                    self._drag_pushed = False
                 self.is_moving_pivot = True
                 self.selected = {self.active_pin_index}
                 self.drawing_area.queue_draw()
@@ -2806,8 +3068,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             hh = self._find_handle_at(e.x, e.y)
             if hh is not None and not alt:
                 p = self.pins[hh]
-                self._push_undo()
                 self.is_rotating = True
+                self._drag_pushed = False
                 self.rot_grab = math.atan2(wy - p.qy, wx - p.qx) - p.theta
                 self.active_pin_index = hh
                 self.selected = {hh}
@@ -2818,8 +3080,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 si = self._ring_hit(e.x, e.y)
                 if si is not None:
                     p = self.pins[si]
-                    self._push_undo()
                     self.is_scaling = True
+                    self._drag_pushed = False
                     self.scale_grab_dist = max(1e-3, math.hypot(wx - p.qx, wy - p.qy))
                     self.scale_grab = p.scale
                     self.scale_pin0 = (p.dx, p.dy)
@@ -2850,8 +3112,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                     return True
 
                 self._push_undo()
-                sx = round(wx * 2.0) / 2.0
-                sy = round(wy * 2.0) / 2.0
+                wx_s, wy_s = self._snap_world(wx, wy)
+                sx = round(wx_s * 2.0) / 2.0
+                sy = round(wy_s * 2.0) / 2.0
                 self.pins.append(Pin(sx, sy))
                 self.active_pin_index = len(self.pins) - 1
                 self.selected = {self.active_pin_index}
@@ -2909,6 +3172,12 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self._last_drag_world = None
         self.multi_orig = None
         self.multi_anchor = None
+        self._active_snap_guides = (None, None)
+
+        if getattr(self, "_dragging_guide", None) is not None:
+            self._dragging_guide = None
+            self.drawing_area.queue_draw()
+            return True
 
         if e.button == 2:
             self.is_panning = False
@@ -2916,6 +3185,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         if e.button == 1 and self.is_moving_pivot:
             self.is_moving_pivot = False
+            self._drag_pushed = False
             self._sync_pin_panel()
             self.drawing_area.queue_draw()
             return True
@@ -2923,6 +3193,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         if e.button == 1 and self.is_scaling:
             self._cancel_update_timer()
             self.is_scaling = False
+            self._drag_pushed = False
             self._solve_preview()
             self._last_solve_sig = self._solve_sig()
             self._sync_pin_panel()
@@ -2932,6 +3203,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         if e.button == 1 and self.is_rotating:
             self._cancel_update_timer()
             self.is_rotating = False
+            self._drag_pushed = False
             self._solve_preview()
             self._last_solve_sig = self._solve_sig()
             self._sync_pin_panel()
@@ -2959,13 +3231,28 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         wx, wy = self._screen_to_world(e.x, e.y)
 
+        if getattr(self, "_dragging_guide", None) is not None:
+            idx = self._dragging_guide
+            if 0 <= idx < len(self._local_guides):
+                ori = self._local_guides[idx][0]
+                self._local_guides[idx][1] = round(wy if ori == "H" else wx, 1)
+                self.drawing_area.queue_draw()
+                return True
+
         if self.is_moving_pivot and self.active_pin_index is not None:
+            if not self._drag_pushed:
+                self._push_undo()
+                self._drag_pushed = True
             p = self.pins[self.active_pin_index]
-            p.qx, p.qy = wx, wy
+            wx_s, wy_s = self._snap_world(wx, wy)
+            p.qx, p.qy = wx_s, wy_s
             self.drawing_area.queue_draw()
             return True
 
         if self.is_scaling and self.active_pin_index is not None:
+            if not self._drag_pushed:
+                self._push_undo()
+                self._drag_pushed = True
             p = self.pins[self.active_pin_index]
             r = math.hypot(wx - p.qx, wy - p.qy) / self.scale_grab_dist
             ns = max(0.25, min(4.0, self.scale_grab * r))
@@ -2984,6 +3271,9 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             return True
 
         if self.is_rotating and self.active_pin_index is not None:
+            if not self._drag_pushed:
+                self._push_undo()
+                self._drag_pushed = True
             p = self.pins[self.active_pin_index]
             ang = math.atan2(wy - p.qy, wx - p.qx) - self.rot_grab
 
@@ -3038,13 +3328,25 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             ndx = wx + self.drag_offset[0]
             ndy = wy + self.drag_offset[1]
 
+            lock_x = False
+            lock_y = False
             if e.state & Gdk.ModifierType.SHIFT_MASK:
                 ddx0 = ndx - p.sx
                 ddy0 = ndy - p.sy
                 if abs(ddx0) >= abs(ddy0):
                     ndy = p.sy
+                    lock_y = True
                 else:
                     ndx = p.sx
+                    lock_x = True
+
+            ndx, ndy = self._snap_world(
+                ndx,
+                ndy,
+                exclude={self.active_pin_index},
+                lock_x=lock_x,
+                lock_y=lock_y,
+            )
 
             maxd = 3.0 * self.puppet_radius
             ddx = ndx - p.sx
@@ -3055,9 +3357,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 ndx = p.sx + ddx / rr * maxd
                 ndy = p.sy + ddy / rr * maxd
 
+            min_step = self._drag_min_step / max(1.0, self.zoom)
             if self._last_drag_world is not None:
                 lx, ly = self._last_drag_world
-                if abs(ndx - lx) < self._drag_min_step and abs(ndy - ly) < self._drag_min_step:
+                if abs(ndx - lx) < min_step and abs(ndy - ly) < min_step:
                     return True
 
             self._last_drag_world = (ndx, ndy)
@@ -3079,9 +3382,18 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             and not self.is_scaling
             and not self.is_moving_pivot
         ):
+            redraw = False
             h = self._find_pin_at(e.x, e.y)
             if h != self.hovered_pin_index:
                 self.hovered_pin_index = h
+                redraw = True
+
+            hg = self._guide_handle_hit(e.x, e.y)
+            if hg != getattr(self, "_hovered_guide", None):
+                self._hovered_guide = hg
+                redraw = True
+
+            if redraw:
                 self.drawing_area.queue_draw()
 
         return False
@@ -3092,7 +3404,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         alt = bool(st & Gdk.ModifierType.MOD1_MASK)
         shift = bool(st & Gdk.ModifierType.SHIFT_MASK)
 
-        # Shift wheel: taper pin.
         if shift and not ctrl and not alt:
             h = self._find_pin_at(e.x, e.y)
             if h is None:
@@ -3104,11 +3415,13 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                     tstep = -0.05
                 else:
                     return True
-                self._push_undo()
+                self._begin_edit_burst()
                 p = self.pins[h]
                 p.taper = max(0.0, min(1.0, p.taper + tstep))
                 self.active_pin_index = h
                 self.selected = {h}
+                self._panel_sync_t = time.monotonic()
+                self._sync_pin_panel()
                 self._schedule_update()
                 self.drawing_area.queue_draw()
                 return True
@@ -3126,7 +3439,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 else:
                     return True
 
-                self._push_undo()
+                self._begin_edit_burst()
                 p = self.pins[h]
                 ns = max(0.25, min(4.0, p.scale + step))
                 k = ns / p.scale if p.scale else 1.0
@@ -3134,6 +3447,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 p.dy = p.qy + (p.dy - p.qy) * k
                 p.scale = ns
                 self.active_pin_index = h
+                self._panel_sync_t = time.monotonic()
+                self._sync_pin_panel()
                 self._schedule_update()
                 self.drawing_area.queue_draw()
                 return True
@@ -3153,7 +3468,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 else:
                     return True
 
-                self._push_undo()
+                self._begin_edit_burst()
                 p = self.pins[h]
                 c, s = math.cos(step), math.sin(step)
                 rx, ry = p.dx - p.qx, p.dy - p.qy
@@ -3167,6 +3482,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 p.theta = a
                 self.active_pin_index = h
 
+                self._panel_sync_t = time.monotonic()
+                self._sync_pin_panel()
                 self._schedule_update()
                 self.drawing_area.queue_draw()
                 return True
@@ -3196,6 +3513,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
     def _on_leave(self, w, e):
         self.hovered_pin_index = None
+        self._hovered_guide = None
         self.drawing_area.queue_draw()
         return False
 
@@ -3215,6 +3533,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         self.drawing_area.queue_draw()
 
     def _clear_pins(self):
+        self._exit_compare_modes(keep_shown=False)
         self._push_undo()
         self.pins = []
         self.active_pin_index = None
@@ -3232,7 +3551,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         dw = a.width if a.width > 50 else 800
         dh = a.height if a.height > 50 else 600
 
-        # Fit active layer, background preview, and extend padding if visible.
         x0, y0 = 0.0, 0.0
         x1, y1 = float(self.canvas_w), float(self.canvas_h)
 
@@ -3243,6 +3561,14 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             y0 = min(y0, float(by))
             x1 = max(x1, float(bx) + float(bw))
             y1 = max(y1, float(by) + float(bh))
+
+        fb = getattr(self, "_fg_bounds", None)
+        if fb is not None:
+            fx, fy, fw, fh = fb
+            x0 = min(x0, float(fx))
+            y0 = min(y0, float(fy))
+            x1 = max(x1, float(fx) + float(fw))
+            y1 = max(y1, float(fy) + float(fh))
 
         if getattr(self, "extend_on", False):
             x0 = min(x0, -float(getattr(self, "preview_pad_left", 0)))
@@ -3272,8 +3598,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         if getattr(self, "_motion_timer", None) is not None:
             return
 
-        self._motion_pending = True
-        self._motion_timer = GLib.timeout_add(8, self._flush_drag_solve)
+        self._motion_pending = False
+        self._schedule_update()
 
     def _flush_drag_solve(self):
         self._motion_timer = None
@@ -3335,94 +3661,137 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         return 0 if w <= 0.02 else 1 + min(3, int(w * 4))
 
     def _on_draw(self, w, cr):
-        cr.set_source_rgb(0.13, 0.13, 0.14)
-        cr.paint()
+        alloc = self.drawing_area.get_allocation()
+        dw = max(1, alloc.width)
+        dh = max(1, alloc.height)
+
+        used_c_vp = self._vp_render(cr, dw, dh)
 
         cr.save()
         cr.translate(self.pan_x, self.pan_y)
         cr.scale(self.zoom, self.zoom)
 
-        cr.save()
-        cr.rectangle(0, 0, self.canvas_w, self.canvas_h)
-        cr.clip()
-        cr.set_source_surface(self._ensure_checker(), 0, 0)
-        cr.paint()
-        cr.restore()
+        if not used_c_vp:
+            cr.set_source_rgb(0.13, 0.13, 0.14)
+            cr.paint()
 
-        if self._bg_surface is not None:
             cr.save()
-            cr.translate(
-                getattr(self, "_bg_off_x", 0.0),
-                getattr(self, "_bg_off_y", 0.0),
-            )
-            cr.set_source_surface(self._bg_surface, 0, 0)
-
-            a = getattr(self, "_bg_alpha", 1.0)
-            if a >= 0.999:
-                cr.paint()
-            else:
-                cr.paint_with_alpha(a)
-
+            cr.rectangle(0, 0, self.canvas_w, self.canvas_h)
+            cr.clip()
+            cr.set_source(self._ensure_checker())
+            cr.paint()
             cr.restore()
 
-        self._warp_preview_cairo(cr)
+            if self._bg_surface is not None:
+                cr.save()
+                cr.translate(
+                    getattr(self, "_bg_off_x", 0.0),
+                    getattr(self, "_bg_off_y", 0.0),
+                )
+                cr.set_source_surface(self._bg_surface, 0, 0)
+
+                a = getattr(self, "_bg_alpha", 1.0)
+                if a >= 0.999:
+                    cr.paint()
+                else:
+                    cr.paint_with_alpha(a)
+
+                cr.restore()
+
+            self._warp_preview_cairo(cr)
+
+            if getattr(self, "_fg_surface", None) is not None:
+                cr.save()
+                cr.translate(
+                    getattr(self, "_fg_off_x", 0.0),
+                    getattr(self, "_fg_off_y", 0.0),
+                )
+                cr.set_source_surface(self._fg_surface, 0, 0)
+                fa = getattr(self, "_fg_alpha", 1.0)
+                if fa >= 0.999:
+                    cr.paint()
+                else:
+                    cr.paint_with_alpha(fa)
+                cr.restore()
 
         style = self.mesh_style
         if (
-            not self.is_dragging_pin
+            not getattr(self, "_compare_orig_on", False)
+            and not self.is_dragging_pin
             and not self.is_rotating
             and not self.is_scaling
             and style != "off"
         ):
-            ws = self.cell_weights(self.cols, self.rows) if self.use_stiffness else None
-            verts = self.deformed_verts
+            mesh_sig = (
+                self._solve_seq,
+                self.cols,
+                self.rows,
+                style,
+                bool(self.use_stiffness),
+                self.mesh_color,
+            )
+            cache = getattr(self, "_mesh_path_cache", None)
+            if cache is not None and cache[0] == mesh_sig:
+                cached_paths = cache[1]
+            else:
+                ws = self.cell_weights(self.cols, self.rows) if self.use_stiffness else None
+                verts = self._get_deformed_verts()
 
-            if verts is None:
-                verts = [
-                    (
-                        self.puppet_x + cc * self.puppet_w / self.cols,
-                        self.puppet_y + rr * self.puppet_h / self.rows,
-                    )
-                    for rr in range(self.rows + 1)
-                    for cc in range(self.cols + 1)
-                ]
+                if verts is None:
+                    verts = [
+                        (
+                            self.puppet_x + cc * self.puppet_w / self.cols,
+                            self.puppet_y + rr * self.puppet_h / self.rows,
+                        )
+                        for rr in range(self.rows + 1)
+                        for cc in range(self.cols + 1)
+                    ]
 
-            mr, mg, mb = self.mesh_color
-            cr.set_line_width(max(0.75, 1.0 / self.zoom))
-
-            # Group cells by colour: one stroke per colour instead of one per cell.
-            groups = {}
-            for rr in range(self.rows):
-                for cc in range(self.cols):
-                    i00 = rr * (self.cols + 1) + cc
-                    i10 = i00 + 1
-                    i01 = i00 + (self.cols + 1)
-                    i11 = i01 + 1
-                    if ws is None:
-                        rgba = (mr, mg, mb, 0.25)
-                    else:
-                        b = self._weight_bucket(ws[rr * self.cols + cc])
-                        if b == 0:
-                            rgba = (1.0, 0.25, 0.20, 0.12)
+                mr, mg, mb = self.mesh_color
+                groups = {}
+                for rr in range(self.rows):
+                    for cc in range(self.cols):
+                        i00 = rr * (self.cols + 1) + cc
+                        i10 = i00 + 1
+                        i01 = i00 + (self.cols + 1)
+                        i11 = i01 + 1
+                        if ws is None:
+                            rgba = (mr, mg, mb, 0.25)
                         else:
-                            rgba = (mr, mg, mb, 0.12 + 0.28 * ((b - 0.5) / 4.0))
-                    groups.setdefault(rgba, []).append((i00, i10, i11, i01))
+                            b = self._weight_bucket(ws[rr * self.cols + cc])
+                            if b == 0:
+                                rgba = (1.0, 0.25, 0.20, 0.12)
+                            else:
+                                rgba = (mr, mg, mb, 0.12 + 0.28 * ((b - 0.5) / 4.0))
+                        groups.setdefault(rgba, []).append((i00, i10, i11, i01))
 
-            for rgba, quads in groups.items():
+                tmp_surf = cairo.ImageSurface(cairo.FORMAT_A8, 1, 1)
+                tmp_cr = cairo.Context(tmp_surf)
+                cached_paths = []
+                for rgba, quads in groups.items():
+                    tmp_cr.new_path()
+                    for i00, i10, i11, i01 in quads:
+                        if style in ("cells", "both"):
+                            tmp_cr.move_to(verts[i00][0], verts[i00][1])
+                            tmp_cr.line_to(verts[i10][0], verts[i10][1])
+                            tmp_cr.line_to(verts[i11][0], verts[i11][1])
+                            tmp_cr.line_to(verts[i01][0], verts[i01][1])
+                            tmp_cr.close_path()
+                        if style in ("triangles", "both"):
+                            tmp_cr.move_to(verts[i10][0], verts[i10][1])
+                            tmp_cr.line_to(verts[i01][0], verts[i01][1])
+                    cached_paths.append((rgba, tmp_cr.copy_path()))
+                tmp_surf.finish()
+                self._mesh_path_cache = (mesh_sig, cached_paths)
+
+            cr.set_line_width(max(0.75, 1.0 / self.zoom))
+            for rgba, path in cached_paths:
                 cr.set_source_rgba(*rgba)
                 cr.new_path()
-                for i00, i10, i11, i01 in quads:
-                    if style in ("cells", "both"):
-                        cr.move_to(verts[i00][0], verts[i00][1])
-                        cr.line_to(verts[i10][0], verts[i10][1])
-                        cr.line_to(verts[i11][0], verts[i11][1])
-                        cr.line_to(verts[i01][0], verts[i01][1])
-                        cr.close_path()
-                    if style in ("triangles", "both"):
-                        cr.move_to(verts[i10][0], verts[i10][1])
-                        cr.line_to(verts[i01][0], verts[i01][1])
+                cr.append_path(path)
                 cr.stroke()
 
+            mr, mg, mb = self.mesh_color
             cr.set_source_rgba(mr, mg, mb, 0.5)
             cr.set_line_width(max(1.0, 1.5 / self.zoom))
             cr.rectangle(self.puppet_x, self.puppet_y, self.puppet_w, self.puppet_h)
@@ -3432,7 +3801,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         for i, p in enumerate(self.pins):
             if (
-                not self.is_dragging_pin
+                not getattr(self, "_compare_orig_on", False)
+                and not self.is_dragging_pin
                 and not self.is_rotating
                 and (abs(p.dx - p.sx) > 0.5 or abs(p.dy - p.sy) > 0.5)
             ):
@@ -3445,17 +3815,20 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 cr.stroke()
                 cr.restore()
 
-            if p.taper > 0.01 and (i == self.active_pin_index or i == self.hovered_pin_index):
+            px_draw = p.sx if getattr(self, "_compare_orig_on", False) else p.dx
+            py_draw = p.sy if getattr(self, "_compare_orig_on", False) else p.dy
+
+            if not getattr(self, "_compare_orig_on", False) and p.taper > 0.01 and (i == self.active_pin_index or i == self.hovered_pin_index):
                 rt = self._taper_base_radius() * (1.0 + p.taper * 3.0)
                 cr.save()
                 cr.set_source_rgba(0.75, 0.45, 1.0, 0.28)
                 cr.set_line_width(max(1.0, 1.5 / self.zoom))
-                cr.arc(p.dx, p.dy, rt, 0, 6.2832)
+                cr.arc(px_draw, py_draw, rt, 0, 6.2832)
                 cr.stroke()
                 cr.restore()
 
             cr.set_source_rgba(0, 0, 0, 0.85)
-            cr.arc(p.dx, p.dy, pr + 1.5 / self.zoom, 0, 6.2832)
+            cr.arc(px_draw, py_draw, pr + 1.5 / self.zoom, 0, 6.2832)
             cr.fill()
 
             if i == self.active_pin_index:
@@ -3467,14 +3840,14 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             else:
                 cr.set_source_rgb(1.0, 0.9, 0.2)
 
-            cr.arc(p.dx, p.dy, pr, 0, 6.2832)
+            cr.arc(px_draw, py_draw, pr, 0, 6.2832)
             cr.fill()
 
             if i in self.selected and i != self.active_pin_index:
                 cr.save()
                 cr.set_source_rgba(1.0, 1.0, 1.0, 0.85)
                 cr.set_line_width(max(1.0, 1.5 / self.zoom))
-                cr.arc(p.dx, p.dy, pr + 2.5 / self.zoom, 0, 6.2832)
+                cr.arc(px_draw, py_draw, pr + 2.5 / self.zoom, 0, 6.2832)
                 cr.stroke()
                 cr.restore()
 
@@ -3488,14 +3861,15 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                     lbl += f"t={p.taper:.2f}"
                 if p.depth:
                     lbl += (f"  d={p.depth:+d}" if lbl else f"d={p.depth:+d}")
-                cr.move_to(p.dx + pr + 4.0 / z, p.dy - pr - 2.0 / z)
+                cr.move_to(px_draw + pr + 4.0 / z, py_draw - pr - 2.0 / z)
                 cr.show_text(lbl)
                 cr.restore()
 
         i = self.active_pin_index
 
         if (
-            self.rotate_on
+            not getattr(self, "_compare_orig_on", False)
+            and self.rotate_on
             and i is not None
             and 0 <= i < len(self.pins)
             and not self.is_dragging_pin
@@ -3585,42 +3959,72 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         cr.restore()
 
+        alloc = self.drawing_area.get_allocation()
+        self._draw_extras_overlay(cr, max(1, alloc.width), max(1, alloc.height))
+
     def _warp_preview_cairo(self, cr):
         for k in self._tri_stat:
             self._tri_stat[k] = 0
 
-        n_expect = (self.cols + 1) * (self.rows + 1)
-        verts = self.deformed_verts
-
-        if verts is None or len(verts) != n_expect:
-            verts = self._last_good_verts
-
-        if verts is None or len(verts) != n_expect:
-            cr.set_source_surface(self.src_surface, 0, 0)
-            cr.paint_with_alpha(0.55)
+        op = float(getattr(self, "preview_opacity", 1.0))
+        if op <= 0.001:
             return
+
+        if getattr(self, "_compare_orig_on", False):
+            cr.save()
+            cr.set_source_surface(self.src_surface, 0, 0)
+            if op < 0.999:
+                cr.paint_with_alpha(op)
+            else:
+                cr.paint()
+            cr.restore()
+            return
+
+        n_expect = (self.cols + 1) * (self.rows + 1)
+        has_raw = (
+            self._verts_raw is not None
+            and self._verts_raw_n == n_expect
+            and self._verts_raw_seq == self._solve_seq
+        )
+
+        if not has_raw:
+            verts_chk = self._get_deformed_verts()
+            if verts_chk is None or len(verts_chk) != n_expect:
+                cr.set_source_surface(self.src_surface, 0, 0)
+                cr.paint_with_alpha(0.55 * op)
+                return
 
         lib = _pw_lib_handle()
         depth_on = self._depth_on()
+        has_ex = lib is not None and hasattr(lib, "pw_render_preview_view_ex")
         use_depth_preview = bool(
-            depth_on and lib is not None and hasattr(lib, "pw_render_preview_view_depth")
+            depth_on
+            and lib is not None
+            and (has_ex or hasattr(lib, "pw_render_preview_view_depth"))
         )
 
-        # C preview supports depth via z-buffer; old builds fall back to Python.
         if (
             lib is not None
-            and hasattr(lib, "pw_render_preview_view")
+            and (has_ex or hasattr(lib, "pw_render_preview_view"))
             and os.environ.get("PW_NO_C_PREVIEW") != "1"
             and (not depth_on or use_depth_preview)
         ):
-            dragging = (self.is_dragging_pin or self.is_rotating
-                        or self.is_scaling or self.is_moving_pivot)
+            dragging = bool(
+                self.is_dragging_pin
+                or self.is_rotating
+                or self.is_scaling
+                or self.is_moving_pivot
+            )
 
             if dragging:
                 vx0, vy0, vx1, vy1, scale_now = self._view_rect()
-                vkey = ("v",
-                        round(vx0, 1), round(vy0, 1),
-                        round(vx1, 1), round(vy1, 1))
+                vkey = (
+                    "v",
+                    round(vx0, 1),
+                    round(vy0, 1),
+                    round(vx1, 1),
+                    round(vy1, 1),
+                )
             else:
                 vx0, vy0, vx1, vy1, scale_now = self._raster_geometry()
                 vkey = ("c",)
@@ -3644,19 +4048,43 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 cr.translate(vx0, vy0)
                 cr.scale(1.0 / scale_now, 1.0 / scale_now)
                 cr.set_source_surface(dst, 0, 0)
-                cr.paint()
+                if op < 0.999:
+                    cr.paint_with_alpha(op)
+                else:
+                    cr.paint()
                 cr.restore()
                 return
 
-            if self._c_render(lib, cr, verts, depth_on, use_depth_preview):
+            if self._c_render(
+                lib,
+                cr,
+                vx0,
+                vy0,
+                vx1,
+                vy1,
+                scale_now,
+                dragging,
+                depth_on,
+                use_depth_preview,
+            ):
                 self._raster_key = key
                 return
+
+        verts = self._get_deformed_verts()
+        if verts is None or len(verts) != n_expect:
+            cr.set_source_surface(self.src_surface, 0, 0)
+            cr.paint_with_alpha(0.55 * op)
+            return
 
         cols, rows = self.cols, self.rows
 
         pattern = cairo.SurfacePattern(self.src_surface)
         pattern.set_filter(cairo.FILTER_BILINEAR)
         pattern.set_extend(cairo.EXTEND_PAD if getattr(self, "extend_on", False) else cairo.EXTEND_NONE)
+
+        use_group = op < 0.999
+        if use_group:
+            cr.push_group()
 
         try:
             if self._depth_on():
@@ -3730,6 +4158,10 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
         except Exception:
             pass
+        finally:
+            if use_group:
+                cr.pop_group_to_source()
+                cr.paint_with_alpha(op)
 
         if _PW_DEBUG:
             print("[pw-py-tri]", self._tri_stat)
@@ -3756,7 +4188,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         ssq12 = (x2 - x1) ** 2 + (y2 - y1) ** 2
         ssq20 = (x0 - x2) ** 2 + (y0 - y2) ** 2
 
-        if dsq01 > 64.0 * ssq01 or dsq12 > 64.0 * ssq12 or dsq20 > 64.0 * ssq20:
+        if dsq01 > 1024.0 * ssq01 or dsq12 > 1024.0 * ssq12 or dsq20 > 1024.0 * ssq20:
             self._tri_stat["scale"] += 1
             return
 
@@ -3803,39 +4235,26 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             self._tri_stat["cairo"] += 1
 
     def _ensure_checker(self):
-        if (
-            self._checker is not None
-            and self._checker_w == self.canvas_w
-            and self._checker_h == self.canvas_h
-        ):
+        if self._checker is not None:
             return self._checker
 
-        surf = cairo.ImageSurface(
-            cairo.FORMAT_ARGB32,
-            self.canvas_w,
-            self.canvas_h,
-        )
-
-        crc = cairo.Context(surf)
         size = 16
-
-        for rr in range(int(math.ceil(self.canvas_h / size))):
-            for cc in range(int(math.ceil(self.canvas_w / size))):
-                if (rr + cc) % 2 == 0:
-                    crc.set_source_rgb(0.85, 0.85, 0.85)
-                else:
-                    crc.set_source_rgb(0.65, 0.65, 0.65)
-
-                crc.rectangle(cc * size, rr * size, size, size)
-                crc.fill()
-
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size * 2, size * 2)
+        crc = cairo.Context(surf)
+        crc.set_source_rgb(0.85, 0.85, 0.85)
+        crc.paint()
+        crc.set_source_rgb(0.65, 0.65, 0.65)
+        crc.rectangle(size, 0, size, size)
+        crc.rectangle(0, size, size, size)
+        crc.fill()
         surf.flush()
 
-        self._checker = surf
-        self._checker_w = self.canvas_w
-        self._checker_h = self.canvas_h
-
-        return surf
+        pat = cairo.SurfacePattern(surf)
+        pat.set_extend(cairo.EXTEND_REPEAT)
+        pat.set_filter(cairo.FILTER_NEAREST)
+        self._checker_surf = surf
+        self._checker = pat
+        return pat
 
     def _dst_has_content(self):
         try:
@@ -3865,28 +4284,22 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         except Exception:
             return False
 
-    def _c_render(self, lib, cr, verts, depth_on=False, use_depth_preview=False):
+    def _c_render(self, lib, cr, vx0, vy0, vx1, vy1, scale, dragging,
+                  depth_on=False, use_depth_preview=False):
         try:
             nverts = (self.cols + 1) * (self.rows + 1)
 
-            if verts is None or len(verts) != nverts:
-                return False
+            if (
+                self._verts_raw is not None
+                and self._verts_raw_n == nverts
+                and self._verts_raw_seq == self._solve_seq
+            ):
+                raw = self._verts_raw
+            else:
+                raw = self._ensure_verts_raw(self._get_deformed_verts(), nverts)
 
-            raw = self._ensure_verts_raw(verts, nverts)
             if raw is None:
                 return False
-
-            dragging = bool(
-                getattr(self, "is_dragging_pin", False)
-                or getattr(self, "is_rotating", False)
-                or getattr(self, "is_scaling", False)
-                or getattr(self, "is_moving_pivot", False)
-            )
-
-            if dragging:
-                vx0, vy0, vx1, vy1, scale = self._view_rect()
-            else:
-                vx0, vy0, vx1, vy1, scale = self._raster_geometry()
 
             sw = max(1, int((vx1 - vx0) * scale))
             sh = max(1, int((vy1 - vy0) * scale))
@@ -3902,6 +4315,7 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
 
             self._dst_surface = dst
 
+            dst.flush()
             src_mv = self.src_surface.get_data()
             dst_mv = dst.get_data()
 
@@ -3909,9 +4323,6 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             dst_ptr = ctypes.addressof(ctypes.c_char.from_buffer(dst_mv))
 
             t0 = time.monotonic()
-
-            if not hasattr(lib, "pw_render_preview_view"):
-                return False
 
             common_args = (
                 ctypes.c_void_p(src_ptr),
@@ -3936,7 +4347,27 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                 ctypes.c_int(1 if bool(getattr(self, "extend_on", False)) else 0),
             )
 
-            if use_depth_preview:
+            if hasattr(lib, "pw_render_preview_view_ex"):
+                active_arr = self.cell_active_payload(self.cols, self.rows)
+                if use_depth_preview:
+                    vd = self._compute_vertex_depths()
+                    if len(vd) != nverts:
+                        return False
+                    varr = (ctypes.c_int * nverts)(*vd)
+                    ret = lib.pw_render_preview_view_ex(
+                        *common_args,
+                        ctypes.c_int(1),
+                        ctypes.cast(varr, ctypes.POINTER(ctypes.c_int)),
+                        ctypes.cast(active_arr, ctypes.POINTER(ctypes.c_uint8)),
+                    )
+                else:
+                    ret = lib.pw_render_preview_view_ex(
+                        *common_args,
+                        ctypes.c_int(0),
+                        ctypes.POINTER(ctypes.c_int)(),
+                        ctypes.cast(active_arr, ctypes.POINTER(ctypes.c_uint8)),
+                    )
+            elif use_depth_preview:
                 vd = self._compute_vertex_depths()
                 if len(vd) != nverts:
                     return False
@@ -3948,6 +4379,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
                     ctypes.cast(varr, ctypes.POINTER(ctypes.c_int)),
                 )
             else:
+                if not hasattr(lib, "pw_render_preview_view"):
+                    return False
                 ret = lib.pw_render_preview_view(*common_args)
 
             rt = (time.monotonic() - t0) * 1000.0
@@ -3969,7 +4402,11 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
             cr.translate(vx0, vy0)
             cr.scale(1.0 / scale, 1.0 / scale)
             cr.set_source_surface(dst, 0, 0)
-            cr.paint()
+            op = float(getattr(self, "preview_opacity", 1.0))
+            if op < 0.999:
+                cr.paint_with_alpha(op)
+            else:
+                cr.paint()
             cr.restore()
 
             stat = getattr(self, "_tri_stat", None)
@@ -3994,6 +4431,8 @@ Pin depth: select pin, [ back / ] front (overlap order).""")
         except Exception as e:
             print(f"[puppet-warp] c-preview failed, fallback python: {e}")
             return False
+
+
 class PuppetWarpPlugin(Gimp.PlugIn):
     def do_set_i18n(self, procname):
         return True, None, None
@@ -4031,10 +4470,18 @@ class PuppetWarpPlugin(Gimp.PlugIn):
         return proc
 
     def run(self, procedure, run_mode, image, drawables, config, data):
+        if run_mode == Gimp.RunMode.NONINTERACTIVE:
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
+
         if len(drawables) != 1 or not isinstance(drawables[0], Gimp.Drawable):
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
 
-        if run_mode == Gimp.RunMode.NONINTERACTIVE:
+        if not isinstance(drawables[0], Gimp.Layer) or (
+            hasattr(drawables[0], "is_group") and drawables[0].is_group()
+        ):
+            Gimp.message(
+                "Puppet Warp: please select a regular layer (not a layer group or mask)."
+            )
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
 
         try:
@@ -4065,7 +4512,16 @@ class PuppetWarpPlugin(Gimp.PlugIn):
 
             resp = dlg.run()
 
-            # Freeze final pad before reading JSON/plan.
+            if resp == Gtk.ResponseType.OK:
+                dlg._exit_compare_modes(keep_shown=False)
+                if getattr(dlg, "_update_timer", None):
+                    dlg._cancel_update_timer()
+                    dlg._solve_preview()
+                elif getattr(dlg, "_draft_solve", False):
+                    # last drag solve used fewer iterations: converge fully before commit
+                    dlg._warm_solve = True
+                    dlg._solve_preview()
+
             dlg.finalize_extend_pad()
 
             params_json = dlg.get_params_json()
@@ -4073,31 +4529,76 @@ class PuppetWarpPlugin(Gimp.PlugIn):
             plan = dlg.get_resize_plan()
             drawable = drawables[0]
 
+            export_items = []
+            if resp == Gtk.ResponseType.OK and getattr(dlg, "export_snaps_on", False):
+                for slot in ("A", "B", "C"):
+                    st = dlg._snapshots.get(slot)
+                    if st is not None:
+                        s_json, s_plan, s_pins = dlg.build_snapshot_export_data(st)
+                        export_items.append((slot, s_json, s_plan, s_pins))
+
             dlg.destroy()
 
             if resp != Gtk.ResponseType.OK:
                 return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
 
-            if pin_count == 0:
-                remove_filter_from_drawable(drawable)
+            undo_started = False
+            try:
+                if image is not None and hasattr(image, "undo_group_start"):
+                    image.undo_group_start()
+                    undo_started = True
+            except Exception:
+                undo_started = False
+
+            try:
+                if export_items:
+                    parent = drawable.get_parent() if hasattr(drawable, "get_parent") else None
+                    base_pos = image.get_item_position(drawable)
+                    base_name = drawable.get_name() or "Layer"
+
+                    for idx, (slot, s_json, s_plan, s_pins) in enumerate(export_items):
+                        try:
+                            copy_layer = drawable.copy()
+                        except Exception:
+                            copy_layer = Gimp.Layer.copy(drawable)
+
+                        if copy_layer is None:
+                            continue
+
+                        copy_layer.set_name(f"{base_name} [Warp {slot}]")
+                        image.insert_layer(copy_layer, parent, base_pos + idx)
+                        remove_filter_from_drawable(copy_layer)
+
+                        if s_plan and s_plan.get("needs_resize"):
+                            _resize_drawable_plan(copy_layer, s_plan)
+
+                        if s_pins > 0:
+                            apply_filter_to_drawable(copy_layer, s_json)
+
+                if pin_count == 0:
+                    remove_filter_from_drawable(drawable)
+                    if plan and plan.get("needs_resize"):
+                        if not _resize_drawable_plan(drawable, plan):
+                            Gimp.message("Puppet Warp: could not restore the original layer size.")
+                    try:
+                        Gimp.displays_flush()
+                    except Exception:
+                        pass
+                    return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
+
                 if plan and plan.get("needs_resize"):
+                    remove_filter_from_drawable(drawable)
                     if not _resize_drawable_plan(drawable, plan):
-                        Gimp.message("Puppet Warp: could not restore the original layer size.")
-                try:
-                    Gimp.displays_flush()
-                except Exception:
-                    pass
-                return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
+                        Gimp.message("Puppet Warp: could not resize the layer for Extend Image.")
+                        return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
 
-            # Resize before attaching the filter so GEGL sees the padded layer.
-            if plan and plan.get("needs_resize"):
-                remove_filter_from_drawable(drawable)
-                if not _resize_drawable_plan(drawable, plan):
-                    Gimp.message("Puppet Warp: could not resize the layer for Extend Image.")
-                    return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
-
-            # Verts ride in the JSON itself; no temp sidecar file.
-            apply_filter_to_drawable(drawables[0], params_json)
+                apply_filter_to_drawable(drawable, params_json)
+            finally:
+                if undo_started and image is not None:
+                    try:
+                        image.undo_group_end()
+                    except Exception:
+                        pass
 
             try:
                 Gimp.displays_flush()
@@ -4122,6 +4623,6 @@ class PuppetWarpPlugin(Gimp.PlugIn):
         finally:
             _dialog_lock_release(lock)
 
+
 if __name__ == "__main__":
     Gimp.main(PuppetWarpPlugin.__gtype__, sys.argv)
-
